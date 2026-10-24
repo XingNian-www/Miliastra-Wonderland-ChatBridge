@@ -1,0 +1,15 @@
+/target
+/native/bin/
+/native/obj/
+/native/tests/bin/
+/native/tests/obj/
+/artifacts/
+*.log
+*.err
+*.json
+.idea
+.vscode
+
+# 文档只提交接口规格，其余（对接指引、实现约束）留在本地。
+docs/*
+!docs/API.md

@@ -1,0 +1,98 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-test:
+    name: Rust tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup update stable --no-self-update
+      - name: Run Rust tests
+        run: cargo +stable test --locked
+
+  windows-build:
+    name: Windows native regression and release build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup update stable --no-self-update
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '9.0.x'
+      - name: Check project and tag versions
+        id: version
+        run: ./.github/scripts/check-version.ps1
+      - name: Run real native source regression
+        run: dotnet run --project native/tests/Native.Regression.csproj --configuration Release --property:PlatformTarget=x64
+      - name: Publish native DLL with NativeAOT
+        run: dotnet publish native/MiliastraWonderlandChatBridge.Native.csproj --configuration Release --runtime win-x64 --self-contained true --property:PublishAot=true --output build/native
+      - name: Build Windows x64 Rust host
+        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
+      - name: Smoke test host entry point
+        run: |
+          & ./target/x86_64-pc-windows-msvc/release/miliastra-wonderland-chatbridge.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "Host help smoke test failed." }
+      - name: Package Windows x64 and SHA256
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./.github/scripts/package-windows.ps1 -Version $env:PACKAGE_VERSION
+      - name: Upload tested Windows distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-release
+          path: |
+            build/release/*.zip
+            build/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish tag release
+    if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [rust-test, windows-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested distribution
+        uses: actions/download-artifact@v5
+        with:
+          name: windows-x64-release
+          path: release
+      - name: Verify distribution checksum
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_TAG" release/*.zip release/SHA256SUMS
+          --verify-tag --generate-notes --title "$RELEASE_TAG"
+          --notes "Windows x64 package includes the Rust host, NativeAOT DLL, versioned metadata.bin, licenses, README and API documentation. Runtime metadata may need updating after a game update. No game is started during CI."

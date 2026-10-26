@@ -27,6 +27,30 @@ miliastra-wonderland-chatbridge --port 18889 --token <自定义令牌> --self-ui
 
 页面是内嵌的单文件 HTML，不引用外部资源；令牌只保存在浏览器 `localStorage`，不写入页面，也不随页面响应返回。
 
+## 诊断
+
+被 Music 以隐藏窗口拉起时，stdout 进 NUL，控制台什么也看不到。为此提供四类观测手段：
+
+- **文件日志**：默认写到程序同目录的 `chatbridge.log`（超过 8 MiB 滚动为 `.log.1`）。可用 `--log-file <path>` 改路径，`--no-log-file` 关闭。
+- **`GET /health` 的 `diag` 字段**：一眼判断死活——`dllConnected`、`framesPerSec`、`lastFrameAgeMs`、`ackP99Us`、`spinHitRate`、`lastMessageAgeMs` 等。
+- **`GET /debug/metrics`**：完整快照（管道吞吐、回执/解析分位、缓冲字节、订阅数、丢帧滞后、高频 cmd、构建版本）。
+- **`GET /debug/events`**：最近 64 条关键事件（连接/断开、协议错误、订阅滞后），带相对启动的毫秒偏移。
+
+启动前可先跑自检，不启动游戏、不注入：
+
+```sh
+miliastra-wonderland-chatbridge --diagnose --port 18889 --token <令牌> --self-uid <UID>
+```
+
+它会检查端口占用、DLL、`metadata.bin`，Windows 上还会校验游戏 exe 的 CRC32 与 RVA 表完整性。
+
+### 排查"消息延迟"的顺序
+
+1. `/health` 的 `diag.framesPerSec`：约 20/秒说明收包循环仍被 50ms 轮询限制；数百以上说明管道正常。
+2. `diag.ackP99Us`：接近 50ms 代表每包都在等空闲轮询；个位数毫秒代表自旋命中。
+3. 延迟发生时立刻 `GET /messages?since=<最后一条 id>`：立刻有 → 延迟在 WS/观察台；没有 → 还在管道或注入。
+4. `/debug/events` 里出现 `ws_lagged` 表示订阅端落后被断开，需要看页面是否卡顿。
+
 ## 许可与致谢
 
 本项目采用 **GNU GPL v3.0（GPL-3.0-only）**，完整条款见 [LICENSE](LICENSE)。第三方组件保留各自的版权与许可。

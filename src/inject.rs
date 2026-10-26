@@ -62,6 +62,7 @@ pub async fn run(
             &cancelled,
         );
         connected.store(false, Ordering::Relaxed);
+        crate::diag::dll_connected(false);
         result
     })
     .await
@@ -160,6 +161,7 @@ fn serve_once(
     std::mem::forget(pipe);
 
     connected.store(true, Ordering::Relaxed);
+    crate::diag::dll_connected(true);
     tracing::info!("DLL 已连接，开始收包");
     // 管道保持阻塞模式：PIPE_NOWAIT 已废弃，实测会让 ReadFile 返回假的 EOF。
     // 非阻塞检查改用 PeekNamedPipe：高压时先自旋接下一包（见 PIPE_SPIN_WINDOW），
@@ -183,15 +185,21 @@ fn serve_once(
             PipeState::Empty => {
                 // 有积压时下一包在回执后几微秒内就到；先自旋接住它，
                 // 不能每包都退回去吃一次 50ms 空闲轮询（见 PIPE_SPIN_WINDOW）。
-                if last_data_at.elapsed() < ACTIVE_PIPE_WINDOW && wait_for_pipe_data(&stream)? {
-                    last_data_at = std::time::Instant::now();
-                } else {
-                    poll_pause();
+                if last_data_at.elapsed() < ACTIVE_PIPE_WINDOW {
+                    let hit = wait_for_pipe_data(&stream)?;
+                    crate::diag::spin(hit);
+                    if hit {
+                        last_data_at = std::time::Instant::now();
+                        continue;
+                    }
                 }
+                crate::diag::idle_poll();
+                poll_pause();
                 continue;
             }
             PipeState::Closed => {
                 tracing::info!("对端已关闭，结束会话");
+                crate::diag::note("pipe_closed", "host observed peer close");
                 return Ok(());
             }
         }
@@ -209,13 +217,16 @@ fn serve_once(
             return Ok(());
         }
         last_data_at = std::time::Instant::now();
+        crate::diag::frame(read);
         buffered.extend_from_slice(&chunk[..read]);
+        crate::diag::buffered(buffered.len());
         while let Some(&kind) = buffered.first() {
             let (frame, used) = match crate::pipe::parse(kind, &buffered[1..]) {
                 Ok(Some(parsed)) => parsed,
                 Ok(None) => break,
                 Err(error) => {
                     tracing::warn!("管道协议错误，终止会话: {error:#}");
+                    crate::diag::note("pipe_protocol_error", format!("{error:#}"));
                     return Ok(());
                 }
             };
@@ -226,11 +237,15 @@ fn serve_once(
             let reply = crate::pipe::reply(&frame, &rva);
             let is_packet = matches!(&frame, crate::pipe::Frame::Packet { .. });
             if is_packet && !reply.is_empty() {
+                let ack_started = std::time::Instant::now();
                 stream.write_all(&reply).context("写管道失败")?;
+                crate::diag::ack(ack_started.elapsed().as_micros() as u64);
             }
             if let crate::pipe::Frame::Packet { cmd, payload } = &frame {
-                crate::inject_stats::record(*cmd, payload.len());
+                crate::diag::packet(*cmd, payload.len());
+                let dispatch_started = std::time::Instant::now();
                 dispatch(chat, *cmd, payload);
+                crate::diag::dispatch(dispatch_started.elapsed().as_micros() as u64);
             }
             if last_report.elapsed() >= std::time::Duration::from_secs(5) {
                 tracing::info!("已收帧 {frames_seen} 个，缓冲 {} 字节", buffered.len());

@@ -99,6 +99,13 @@ impl Metadata {
     }
 
     /// 按游戏 exe CRC32 查 RVA 表。
+    /// metadata 里登记的游戏版本数（按 exe CRC32 计）。
+    ///
+    /// 自检用来判断"文件能解析但表是空的"这种半坏状态。
+    pub fn games(&self) -> usize {
+        self.rva_by_game.len()
+    }
+
     pub fn for_game(&self, crc32: u32) -> Option<&MethodRva> {
         self.rva_by_game.get(&crc32)
     }

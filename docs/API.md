@@ -26,6 +26,8 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 | GET | `/messages` | 查询缓冲消息 |
 | GET | `/names` | 批量查询昵称 |
 | WebSocket | `/stream` | 实时事件订阅 |
+| GET | `/debug/metrics` | 完整运行指标（诊断） |
+| GET | `/debug/events` | 最近关键事件（诊断） |
 
 ### GET /
 
@@ -45,11 +47,81 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
   "gameConnected": true,
   "currentHall": { "id": 1000000000000000001, "type": 16 },
   "lastMessageId": 42,
-  "subscribers": 1
+  "subscribers": 1,
+  "diag": {
+    "dllConnected": true,
+    "framesPerSec": 21.4,
+    "packetsPerSec": 20.9,
+    "lastFrameAgeMs": 120,
+    "ackP99Us": 51000,
+    "spinHitRate": 0.02,
+    "bufferedBytes": 0,
+    "lastMessageAgeMs": 850,
+    "subscribers": 1,
+    "laggedTotal": 0,
+    "build": "f418449"
+  }
 }
 ```
 
 `currentHall` 未知时为 `null`，其中 `type` 未知时也可为 `null`；`subscribers` 为实时订阅数。
+
+`diag.ackP99Us` 持续接近 50000 微秒，说明收包循环在等 50ms 空闲轮询；`lastMessageAgeMs` 是"距最近一条消息多久"，可用来区分"大厅没人说话"与"链路卡住"。
+
+### GET /debug/metrics
+
+返回完整诊断快照；字段较多且可能随版本增加，调用方应按需取用。
+
+```json
+{
+  "uptimeMs": 3600000,
+  "build": { "version": "0.1.2", "sha": "f418449", "builtAt": "2026-10-26T08:00:00Z" },
+  "pipe": {
+    "dllConnected": true,
+    "framesTotal": 120000,
+    "framesPerSec": 21.4,
+    "packetsTotal": 118000,
+    "packetsPerSec": 20.9,
+    "bytesTotal": 128000000,
+    "lastFrameAgeMs": 120,
+    "bufferedBytes": 0,
+    "ackCount": 118000,
+    "ackAvgUs": 62,
+    "ackP50Us": 48,
+    "ackP99Us": 2400,
+    "ackMaxUs": 51000,
+    "dispatchAvgUs": 180,
+    "dispatchP50Us": 150,
+    "dispatchP99Us": 900,
+    "dispatchMaxUs": 12000,
+    "spinHit": 116000,
+    "spinMiss": 2000,
+    "spinHitRate": 0.983,
+    "idlePolls": 8600
+  },
+  "chat": {
+    "messagesTotal": 421,
+    "lastMessageId": 421,
+    "lastMessageTs": 1792772291,
+    "lastMessageAgeMs": 850,
+    "subscribers": 1,
+    "laggedTotal": 0
+  },
+  "topCmds": [ { "cmd": 2246, "count": 117000 }, { "cmd": 486, "count": 1000 } ],
+  "service": { "port": 18889, "selfUid": 100000009, "uptimeSec": 3600, "lastMessageId": 421, "currentHall": { "id": 1000000000000000001, "type": 16 } }
+}
+```
+
+### GET /debug/events
+
+最近 64 条关键事件，`offsetMs` 相对进程启动。
+
+```json
+{ "events": [
+  { "offsetMs": 1200, "kind": "dll_connected", "detail": "" },
+  { "offsetMs": 540000, "kind": "ws_lagged", "detail": "skipped=12" }
+] }
+```
 
 ### GET /messages
 

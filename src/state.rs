@@ -190,6 +190,7 @@ impl ChatState {
                 text: raw.text,
             };
             inner.last_id = id;
+            crate::diag::message(id, raw.ts);
             // 缓冲写满后丢弃最旧的。
             if inner.messages.len() >= MESSAGE_BUFFER {
                 inner.messages.pop_front();

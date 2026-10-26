@@ -51,6 +51,9 @@ jobs:
       - name: Publish native DLL with NativeAOT
         run: dotnet publish native/MiliastraWonderlandChatBridge.Native.csproj --configuration Release --runtime win-x64 --self-contained true --property:PublishAot=true --output build/native
       - name: Build Windows x64 Rust host
+        env:
+          CHATBRIDGE_BUILD_SHA: ${{ github.sha }}
+          CHATBRIDGE_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
         run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
       - name: Smoke test host entry point
         run: |

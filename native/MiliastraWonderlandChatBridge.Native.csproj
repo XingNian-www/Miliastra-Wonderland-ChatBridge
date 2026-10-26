@@ -21,7 +21,7 @@
 
     <PropertyGroup>
         <PackageId>Miliastra.Wonderland.ChatBridge.Native</PackageId>
-        <Version>0.1.1</Version>
+        <Version>0.1.2</Version>
         <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
         <Description>Genshin chat sniffer DLL for Miliastra-Wonderland-ChatBridge</Description>
     </PropertyGroup>

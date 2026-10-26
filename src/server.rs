@@ -26,6 +26,9 @@ pub struct AppState {
     pub token: String,
     pub started: Instant,
     pub connected: Arc<std::sync::atomic::AtomicBool>,
+    /// 监听端口与自身 UID：诊断接口要展示"这份实例是谁"。
+    pub port: u16,
+    pub self_uid: u32,
 }
 
 /// 组装路由。
@@ -38,6 +41,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/messages", get(messages))
         .route("/names", get(names))
         .route("/stream", get(stream))
+        .route("/debug/metrics", get(debug_metrics))
+        .route("/debug/events", get(debug_events))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -149,6 +154,8 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         }),
         "lastMessageId": state.chat.last_id().await,
         "subscribers": state.chat.subscriber_count().await,
+        // 一眼判断"活着/卡住/断流"的摘要；完整指标在 /debug/metrics。
+        "diag": crate::diag::health_summary(),
     }))
     .into_response()
 }
@@ -282,10 +289,42 @@ async fn stream(
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 诊断指标：管道、收包、消息、订阅的完整快照。
+///
+/// 与 /health 分开：这里字段多、会变动，调用方按需取，不污染健康检查的稳定契约。
+async fn debug_metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    let hall = state.chat.current_hall().await;
+    let snapshot = crate::diag::snapshot();
+    let mut value = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
+    value["service"] = json!({
+        "port": state.port,
+        "selfUid": state.self_uid,
+        "uptimeSec": state.started.elapsed().as_secs(),
+        "lastMessageId": state.chat.last_id().await,
+        "currentHall": hall.map(|(id, ty)| json!({
+            "id": id,
+            "type": if ty == 0 { serde_json::Value::Null } else { json!(ty) },
+        })),
+    });
+    Json(value).into_response()
+}
+
+/// 最近的关键事件（连接/断开/协议错误/订阅滞后），旧的在前。
+async fn debug_events(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    Json(json!({ "events": crate::diag::events() })).into_response()
+}
+
 async fn handle_socket<S, E>(mut socket: S, state: Arc<AppState>)
 where
     S: Stream<Item = Result<Message, E>> + Sink<Message> + Unpin,
 {
+    let _subscriber = crate::diag::subscriber();
     let (mut rx, last_message_id) = state.chat.subscribe_with_last_id().await;
     let hello = ServerEvent::Hello {
         version: env!("CARGO_PKG_VERSION"),
@@ -337,6 +376,7 @@ where
                 }
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!("WS 订阅者落后 {n} 条事件，断开以便重连补拉");
+                    crate::diag::lagged(n);
                     close_socket(&mut socket, 1013, "stream lagged; reconnect and fetch /messages").await;
                     break;
                 }
@@ -439,7 +479,58 @@ mod tests {
             token: "secret".into(),
             started: Instant::now(),
             connected: Arc::new(std::sync::atomic::AtomicBool::new(connected)),
+            port: 18889,
+            self_uid: 999,
         })
+    }
+
+    #[tokio::test]
+    async fn debug_endpoints_require_token_and_expose_metrics() {
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/debug/metrics")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        // 未带令牌：拒绝，且不泄露任何计数。
+        let response = router(app_state(true)).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 带令牌：返回完整快照，至少包含"活着/慢在哪"的关键字段。
+        let authorized = || {
+            axum::http::Request::builder()
+                .uri("/debug/metrics")
+                .header("x-miliastra-token", "secret")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let response = router(app_state(true)).oneshot(authorized()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["pipe"]["framesPerSec"].is_number());
+        assert!(value["pipe"]["ackP99Us"].is_number());
+        assert!(value["pipe"]["bufferedBytes"].is_number());
+        assert!(value["chat"]["messagesTotal"].is_number());
+        assert_eq!(value["service"]["port"], 18889);
+        assert_eq!(value["service"]["selfUid"], 999);
+        assert!(value["build"]["version"].is_string());
+
+        // 事件接口同样要鉴权，并给出数组。
+        let events = axum::http::Request::builder()
+            .uri("/debug/events")
+            .header("x-miliastra-token", "secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router(app_state(true)).oneshot(events).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["events"].is_array());
     }
 
     fn private_message() -> crate::extract::RawChat {

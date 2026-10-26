@@ -21,6 +21,12 @@ miliastra-wonderland-chatbridge --port 18889 --token <自定义令牌> --self-ui
 
 服务监听本机地址。请求使用 `x-miliastra-token` 鉴权，提供 `/health`、`/messages`、`/names` 和 `/stream` 接口。使用 `--help` 查看启动参数。
 
+### 实时观察页
+
+浏览器打开 `http://127.0.0.1:<监听端口>/`，填写启动参数或配置里的访问令牌，即可实时观察注入链路检测到的消息、当前大厅和连接状态。页面用 `/stream` 订阅、`/messages` 补拉；桥接重启（消息 `id` 归零）时会清空旧列表并重新建立基线。
+
+页面是内嵌的单文件 HTML，不引用外部资源；令牌只保存在浏览器 `localStorage`，不写入页面，也不随页面响应返回。
+
 ## 许可与致谢
 
 本项目采用 **GNU GPL v3.0（GPL-3.0-only）**，完整条款见 [LICENSE](LICENSE)。第三方组件保留各自的版权与许可。

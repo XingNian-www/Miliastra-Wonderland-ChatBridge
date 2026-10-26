@@ -9,7 +9,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -31,6 +31,9 @@ pub struct AppState {
 /// 组装路由。
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        // 观察页由浏览器直接打开，页面本身不含数据，令牌由页面本地保存。
+        .route("/", get(observer_page))
+        .route("/favicon.ico", get(favicon))
         .route("/health", get(health))
         .route("/messages", get(messages))
         .route("/names", get(names))
@@ -38,6 +41,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
+}
+
+/// 内嵌的实时观察页：单文件 HTML，不引用外部资源。
+///
+/// 页面只有静态外壳，消息通过同源 API/WS 获取；令牌由浏览器填好后存在
+/// localStorage，不写进 HTML，也不经过本函数的响应。
+async fn observer_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        include_str!("../web/index.html"),
+    )
+        .into_response()
+}
+
+/// 浏览器会固定请求 /favicon.ico；返回 204，避免落到 404 JSON 噪音。
+async fn favicon() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 /// 统一错误响应。
@@ -622,6 +647,57 @@ mod tests {
             app.oneshot(request).await.unwrap().status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[tokio::test]
+    async fn observer_page_is_served_without_token() {
+        let response = router(app_state(false))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        // 页面契约：观察页必须带这些稳定标记，供使用与端到端验证依赖。
+        for marker in [
+            "id=\"status-ws\"",
+            "id=\"token-input\"",
+            "id=\"filter-channel\"",
+            "id=\"messages\"",
+        ] {
+            assert!(html.contains(marker), "观察页缺少标记: {marker}");
+        }
+        // 静态外壳不得携带服务端令牌。
+        assert!(!html.contains("secret"), "观察页不应包含令牌");
+    }
+
+    #[tokio::test]
+    async fn favicon_is_no_content() {
+        let response = router(app_state(false))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/favicon.ico")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.headers().get("content-type").is_none());
     }
 
     #[test]

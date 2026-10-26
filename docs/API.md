@@ -20,10 +20,18 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/` | 内置实时观察页（无需鉴权，不含消息数据） |
+| GET | `/favicon.ico` | 空响应（`204`） |
 | GET | `/health` | 服务与数据源状态 |
 | GET | `/messages` | 查询缓冲消息 |
 | GET | `/names` | 批量查询昵称 |
 | WebSocket | `/stream` | 实时事件订阅 |
+
+### GET /
+
+返回内置的实时观察页（单文件 HTML，不引用外部资源），无需鉴权：页面本身不含消息数据，打开后填写令牌即可查看实时消息与连接状态。令牌只保存在浏览器 `localStorage`；WS 使用 `?token=`，其余请求使用 `x-miliastra-token` 请求头。
+
+桥接重启后消息 `id` 会归零，页面清空旧列表并从新基线开始。`GET /favicon.ico` 固定返回 `204`。
 
 ### GET /health
 

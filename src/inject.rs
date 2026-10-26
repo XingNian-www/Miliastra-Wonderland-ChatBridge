@@ -68,6 +68,42 @@ pub async fn run(
     .context("注入线程异常退出")?
 }
 
+/// 收包循环空转时的自旋窗口。
+///
+/// 为什么需要它：DLL 的发送线程一次只写一个包并等宿主回执，收到回执后才写下一包。
+/// 宿主旧实现回执后立刻 Peek，此时下一包通常还没写进来，于是**每个包**都要吃一次
+/// `poll_pause()`（50ms）。千星大厅里 2246 信封的速率约 20 包/秒，正好卡在这个
+/// 吞吐上限附近；一旦超过，DLL 侧 256 容量的发送队列就会积满：
+///
+///   256 包 × 50ms ≈ 12.8s 固定积压
+///
+/// 实测聊天消息从游戏画面出现到 ChatBridge 落库稳定晚 10–13s，正好等于该上限；
+/// 队列满时新包被 DropWrite 丢弃，表现为「偶尔漏命令」。自旋窗口让宿主在回执后
+/// 继续短等下一包，把吞吐从 ~20/s 提到数千/s，积压随即排空。
+const PIPE_SPIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// 最近一次收包后多久内仍按「高压」处理（自旋等下一包）；超过则回到 50ms 空闲轮询。
+const ACTIVE_PIPE_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// 在自旋窗口内短等下一包；返回是否等到数据。
+///
+/// 只在「刚收过包」时调用：静默期仍走 50ms 空闲轮询，CPU 占用与旧实现一致。
+fn wait_for_pipe_data(stream: &std::fs::File) -> Result<bool> {
+    let deadline = std::time::Instant::now() + PIPE_SPIN_WINDOW;
+    loop {
+        match poll_pipe(stream)? {
+            PipeState::Data => return Ok(true),
+            PipeState::Closed => return Ok(false),
+            PipeState::Empty => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::hint::spin_loop();
+        std::thread::yield_now();
+    }
+}
+
 /// 一次完整的注入会话。
 fn serve_once(
     chat: &ChatState,
@@ -126,12 +162,15 @@ fn serve_once(
     connected.store(true, Ordering::Relaxed);
     tracing::info!("DLL 已连接，开始收包");
     // 管道保持阻塞模式：PIPE_NOWAIT 已废弃，实测会让 ReadFile 返回假的 EOF。
-    // 非阻塞检查改用 PeekNamedPipe，空闲时每 50ms 检查取消和进程。
+    // 非阻塞检查改用 PeekNamedPipe：高压时先自旋接下一包（见 PIPE_SPIN_WINDOW），
+    // 静默时才回到每 50ms 检查取消和进程。
     tracing::info!("等待 DLL 发送首帧...");
 
     let mut buffered: Vec<u8> = Vec::new();
     let mut frames_seen: u64 = 0;
     let mut last_report = std::time::Instant::now();
+    // 最近一次读到数据的时刻：只有刚收过包才自旋等下一包，静默期不额外占 CPU。
+    let mut last_data_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let init_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         check_session(&proc, cancelled, init_deadline)?;
@@ -142,7 +181,13 @@ fn serve_once(
         match poll_pipe(&stream)? {
             PipeState::Data => {}
             PipeState::Empty => {
-                poll_pause();
+                // 有积压时下一包在回执后几微秒内就到；先自旋接住它，
+                // 不能每包都退回去吃一次 50ms 空闲轮询（见 PIPE_SPIN_WINDOW）。
+                if last_data_at.elapsed() < ACTIVE_PIPE_WINDOW && wait_for_pipe_data(&stream)? {
+                    last_data_at = std::time::Instant::now();
+                } else {
+                    poll_pause();
+                }
                 continue;
             }
             PipeState::Closed => {
@@ -163,6 +208,7 @@ fn serve_once(
             tracing::info!("管道返回 0 字节，对端已关闭");
             return Ok(());
         }
+        last_data_at = std::time::Instant::now();
         buffered.extend_from_slice(&chunk[..read]);
         while let Some(&kind) = buffered.first() {
             let (frame, used) = match crate::pipe::parse(kind, &buffered[1..]) {
@@ -175,6 +221,13 @@ fn serve_once(
             };
             buffered.drain(..1 + used);
             frames_seen += 1;
+            // 包帧的 ACK 只表示「保持订阅」，与解析结果无关：先回执让 DLL
+            // 立刻写下一包，把 dispatch 的耗时移出往返路径。
+            let reply = crate::pipe::reply(&frame, &rva);
+            let is_packet = matches!(&frame, crate::pipe::Frame::Packet { .. });
+            if is_packet && !reply.is_empty() {
+                stream.write_all(&reply).context("写管道失败")?;
+            }
             if let crate::pipe::Frame::Packet { cmd, payload } = &frame {
                 crate::inject_stats::record(*cmd, payload.len());
                 dispatch(chat, *cmd, payload);
@@ -191,8 +244,8 @@ fn serve_once(
                 resume_thread(&proc)?;
                 tracing::info!("已恢复游戏主线程");
             }
-            let reply = crate::pipe::reply(&frame, &rva);
-            if !reply.is_empty() {
+            // 其余帧（握手/退出）的回执要等对应动作完成后再写。
+            if !is_packet && !reply.is_empty() {
                 stream.write_all(&reply).context("写管道失败")?;
             }
             if frame == crate::pipe::Frame::Exit {
@@ -205,7 +258,12 @@ fn serve_once(
 fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
     // 独立 486 只承载私聊；信封 2246 才有多路复用内容。
     let (halls, names, population, chats) = if cmd == extract::CMD_PRIVATE_DIRECT {
-        (None, Vec::new(), None, extract::extract_direct_private(payload))
+        (
+            None,
+            Vec::new(),
+            None,
+            extract::extract_direct_private(payload),
+        )
     } else {
         (
             extract::extract_hall_context(payload),
@@ -236,7 +294,6 @@ fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
         chat.ingest(chats).await;
     });
 }
-
 
 struct PipeHandle(windows_sys::Win32::Foundation::HANDLE);
 
@@ -313,8 +370,12 @@ fn create_pipe_once() -> Result<PipeHandle> {
 }
 
 fn create_named_pipe(name: &[u16]) -> Result<PipeHandle> {
-    use windows_sys::Win32::Storage::FileSystem::{PIPE_ACCESS_DUPLEX, FILE_FLAG_FIRST_PIPE_INSTANCE};
-    use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+    };
     // SAFETY: 调用方提供以 NUL 结尾的管道名，其余参数是常量。
     let handle = unsafe {
         CreateNamedPipeW(
@@ -333,7 +394,6 @@ fn create_named_pipe(name: &[u16]) -> Result<PipeHandle> {
     }
     Ok(PipeHandle(handle))
 }
-
 
 /// 管道当前状态。
 enum PipeState {
@@ -368,7 +428,11 @@ fn poll_pipe(stream: &std::fs::File) -> Result<PipeState> {
         }
         return Err(error).context("检查管道状态失败");
     }
-    Ok(if available > 0 { PipeState::Data } else { PipeState::Empty })
+    Ok(if available > 0 {
+        PipeState::Data
+    } else {
+        PipeState::Empty
+    })
 }
 fn poll_pause() {
     std::thread::sleep(std::time::Duration::from_millis(50));

@@ -1,0 +1,1623 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>千星聊天 · 实时观察台</title>
+<style>
+  * { box-sizing: border-box; }
+  :root {
+    --bg: #0f1419;
+    --panel: #141b24;
+    --panel-2: #1a2330;
+    --border: #243040;
+    --text: #e6edf3;
+    --muted: #8b98a8;
+    --accent: #22d3ee;
+    --accent-2: #38bdf8;
+    --blue: #3b82f6;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --err: #f87171;
+  }
+  html, body { margin: 0; padding: 0; max-width: 100%; }
+  body {
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  [hidden] { display: none !important; }
+  button, input, select { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.92em;
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 4px;
+    border-radius: 4px;
+  }
+
+  .topbar {
+    flex: 0 0 auto;
+    padding: 12px 18px 10px;
+    background: linear-gradient(180deg, #141b24 0%, #111821 100%);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar-main { display: flex; align-items: flex-start; gap: 16px; }
+  .brand { flex: 1 1 auto; min-width: 0; }
+  .brand h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    color: #f2f7fb;
+  }
+  .brand .subtitle { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+  .topbar .btn { flex: 0 0 auto; }
+  .statusbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+  }
+  .stat {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 12px;
+  }
+  .stat-hall { max-width: 100%; }
+  .stat-label { color: var(--muted); flex: 0 0 auto; }
+  .status {
+    position: relative;
+    padding-left: 11px;
+    font-weight: 550;
+    overflow-wrap: anywhere;
+  }
+  .status::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin-top: -3px;
+    border-radius: 50%;
+    background: #64748b;
+  }
+  #status-ws[data-state="idle"]::before { background: #64748b; }
+  #status-ws[data-state="connecting"]::before { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+  #status-ws[data-state="connected"]::before { background: var(--ok); box-shadow: 0 0 6px rgba(52, 211, 153, 0.7); }
+  #status-ws[data-state="reconnecting"]::before { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+  #status-ws[data-state="unauthorized"]::before { background: var(--err); }
+  #status-ws[data-state="offline"]::before { background: var(--err); }
+  #status-game[data-state="connected"]::before { background: var(--ok); }
+  #status-game[data-state="disconnected"]::before { background: var(--err); }
+  #status-game[data-state="unknown"]::before { background: #64748b; }
+  #status-hall[data-state="known"]::before { background: var(--accent); }
+  #status-hall[data-state="unknown"]::before { background: #64748b; }
+  .stat-value { font-variant-numeric: tabular-nums; color: var(--text); }
+  .retry {
+    color: var(--warn);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  .btn {
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    line-height: 1.2;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .btn:hover { border-color: #365070; background: #1f2b3a; }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary {
+    background: linear-gradient(180deg, #0ea5b7, #0891b2);
+    border-color: #0e7490;
+    color: #06272e;
+    font-weight: 650;
+  }
+  .btn.primary:hover { filter: brightness(1.08); background: linear-gradient(180deg, #0ea5b7, #0891b2); }
+  .btn.ghost { background: transparent; }
+  .btn:focus-visible,
+  select:focus-visible,
+  input:focus-visible {
+    outline: 2px solid rgba(56, 189, 248, 0.55);
+    outline-offset: 1px;
+  }
+
+  .main {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px 18px 14px;
+  }
+  .banner {
+    flex: 0 0 auto;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    border: 1px solid transparent;
+    overflow-wrap: anywhere;
+  }
+  .banner[data-kind="success"] { background: rgba(52, 211, 153, 0.1); border-color: rgba(52, 211, 153, 0.35); color: #a7f3d0; }
+  .banner[data-kind="error"] { background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.38); color: #fecaca; }
+  .banner[data-kind="info"] { background: rgba(56, 189, 248, 0.1); border-color: rgba(56, 189, 248, 0.35); color: #bae6fd; }
+
+  .toolbar {
+    flex: 0 0 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 8px 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--muted);
+    font-size: 12px;
+    min-width: 0;
+    white-space: nowrap;
+  }
+  .ctl select,
+  .ctl input {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    padding: 5px 8px;
+    font-size: 13px;
+    min-width: 0;
+  }
+  .ctl select { padding-right: 6px; }
+  .ctl.grow { flex: 1 1 220px; white-space: nowrap; }
+  .ctl.grow input { flex: 1 1 160px; width: auto; min-width: 120px; }
+  .ctl.check { color: var(--text); gap: 6px; cursor: pointer; }
+  .ctl.check input { accent-color: var(--accent); }
+  .count {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .rate-box {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .rate-box #rate { color: var(--accent); font-weight: 650; }
+
+  .log-wrap {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    overflow: hidden;
+  }
+  .messages {
+    position: absolute;
+    inset: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 6px 10px 10px;
+    scrollbar-color: #334155 transparent;
+    scrollbar-width: thin;
+  }
+  .messages::-webkit-scrollbar { width: 10px; }
+  .messages::-webkit-scrollbar-track { background: transparent; }
+  .messages::-webkit-scrollbar-thumb {
+    background: #2b3a4d;
+    border-radius: 8px;
+    border: 2px solid var(--panel);
+  }
+  .msg {
+    display: grid;
+    grid-template-columns: 74px 46px minmax(64px, 150px) 1fr;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 6px;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .msg:hover { background: rgba(148, 163, 184, 0.07); }
+  .msg-time {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .msg-channel {
+    justify-self: start;
+    font-size: 11px;
+    line-height: 1.6;
+    padding: 0 6px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .msg-channel[data-channel="current_hall"] {
+    color: #67e8f9;
+    border-color: rgba(34, 211, 238, 0.35);
+    background: rgba(34, 211, 238, 0.08);
+  }
+  .msg-channel[data-channel="private"] {
+    color: #c4b5fd;
+    border-color: rgba(167, 139, 250, 0.35);
+    background: rgba(167, 139, 250, 0.08);
+  }
+  .msg-sender {
+    color: #9fd6ff;
+    font-weight: 550;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .msg-text {
+    min-width: 0;
+    color: #dfe9f3;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .sys {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 6px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: rgba(56, 189, 248, 0.06);
+    border: 1px dashed rgba(56, 189, 248, 0.25);
+    color: #9ad8ff;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .sys::before {
+    content: "系统";
+    flex: 0 0 auto;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    border-radius: 4px;
+    padding: 0 4px;
+  }
+  .sys[data-event="restart"] {
+    background: rgba(251, 191, 36, 0.07);
+    border-color: rgba(251, 191, 36, 0.3);
+    color: #fde68a;
+  }
+  .sys[data-event="restart"]::before {
+    content: "重启";
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.45);
+  }
+  .sys[data-event="truncated"] {
+    background: rgba(248, 113, 113, 0.07);
+    border-color: rgba(248, 113, 113, 0.3);
+    color: #fecaca;
+  }
+  .sys[data-event="truncated"]::before {
+    content: "注意";
+    color: #f87171;
+    border-color: rgba(248, 113, 113, 0.45);
+  }
+  .sys[data-event="hall_changed"]::before { content: "大厅"; }
+
+  .empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 24px;
+    text-align: center;
+    pointer-events: none;
+  }
+  .empty-title { margin: 0; font-size: 15px; font-weight: 600; color: #cbd5e1; }
+  .empty-hint { margin: 0; font-size: 12.5px; color: var(--muted); }
+
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(5, 9, 14, 0.74);
+    backdrop-filter: blur(3px);
+  }
+  .dialog {
+    width: min(440px, 100%);
+    max-height: calc(100dvh - 40px);
+    overflow: auto;
+    background: #141c26;
+    border: 1px solid #2a394b;
+    border-radius: 14px;
+    padding: 20px 20px 18px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  }
+  .dialog h2 { margin: 0 0 6px; font-size: 17px; }
+  .dialog-desc { margin: 0 0 14px; color: var(--muted); font-size: 12.5px; }
+  .field-label { display: block; margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+  #token-input {
+    width: 100%;
+    padding: 9px 11px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: #0f1620;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  #token-input:focus { outline: 2px solid rgba(56, 189, 248, 0.5); border-color: #0e7490; }
+  .token-error { margin: 8px 0 0; color: #fca5a5; font-size: 12.5px; }
+  .hint { margin: 10px 0 0; color: var(--muted); font-size: 12px; }
+  .dialog-actions { display: flex; gap: 10px; margin-top: 16px; }
+  .dialog-actions .btn { flex: 1 1 auto; padding: 9px 14px; }
+
+  @media (max-width: 720px) {
+    .topbar { padding: 10px 12px 8px; }
+    .brand .subtitle { display: none; }
+    .brand h1 { font-size: 16px; }
+    .statusbar { gap: 4px 12px; }
+    .stat { font-size: 11.5px; }
+    .main { padding: 8px 10px 10px; gap: 8px; }
+    .toolbar { gap: 6px 8px; padding: 8px; }
+    .ctl.grow { flex: 1 1 100%; order: 5; }
+    .count { margin-left: 0; }
+    .msg {
+      grid-template-columns: 58px 40px minmax(0, 1fr);
+      gap: 4px 8px;
+      font-size: 12.5px;
+    }
+    .msg-text { grid-column: 1 / -1; }
+    .msg-sender { max-width: 100%; }
+    .overlay { padding: 12px; }
+    .dialog { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-main">
+    <div class="brand">
+      <h1>千星聊天 · 实时观察台</h1>
+      <p class="subtitle">观察注入链路实时检测到的聊天消息与连接状态</p>
+    </div>
+    <button id="btn-settings" class="btn ghost" type="button" aria-label="设置访问令牌">设置</button>
+  </div>
+  <div class="statusbar" role="group" aria-label="连接与数据源状态">
+    <span class="stat"><span class="stat-label">实时</span><span id="status-ws" class="status" data-state="idle">未连接</span><span id="retry-countdown" class="retry" hidden></span></span>
+    <span class="stat"><span class="stat-label">游戏</span><span id="status-game" class="status" data-state="unknown">未知</span></span>
+    <span class="stat stat-hall"><span class="stat-label">大厅</span><span id="status-hall" class="status" data-state="unknown">未知</span></span>
+    <span class="stat"><span class="stat-label">运行</span><span id="status-uptime" class="stat-value">—</span></span>
+    <span class="stat"><span class="stat-label">订阅</span><span id="status-subs" class="stat-value">—</span></span>
+    <span class="stat"><span class="stat-label">最新序号</span><span id="status-lastid" class="stat-value">0</span></span>
+  </div>
+</header>
+<main class="main">
+  <div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
+  <section class="toolbar" aria-label="消息筛选与统计">
+    <label class="ctl" for="filter-channel">频道
+      <select id="filter-channel">
+        <option value="all">全部</option>
+        <option value="current_hall">大厅</option>
+        <option value="private">私聊</option>
+      </select>
+    </label>
+    <label class="ctl grow" for="filter-text">搜索
+      <input id="filter-text" type="search" placeholder="昵称 / UID / 内容" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="ctl check" for="follow"><input id="follow" type="checkbox" checked> 自动跟随</label>
+    <button id="clear" class="btn" type="button" title="仅清空本地显示，不影响服务端缓冲">清空</button>
+    <span id="count" class="count">共 0 条 · 显示 0 条</span>
+    <span class="rate-box" title="最近 60 秒收到的消息条数">近 60 秒 <span id="rate">0</span> 条</span>
+  </section>
+  <div class="log-wrap">
+    <div id="messages" class="messages" role="log" aria-live="polite" aria-label="实时聊天消息" tabindex="0"></div>
+    <div id="empty" class="empty">
+      <p id="empty-title" class="empty-title">等待检测到消息…</p>
+      <p id="empty-hint" class="empty-hint">请确认游戏已启动且注入成功。</p>
+    </div>
+  </div>
+</main>
+<div id="setup" class="overlay" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="setup-title">
+    <h2 id="setup-title">设置访问令牌</h2>
+    <p class="dialog-desc">页面通过本机桥接服务的令牌鉴权，令牌只保存在当前浏览器的 localStorage（miliastra-chat-observer.token）。</p>
+    <form id="token-form" novalidate>
+      <label class="field-label" for="token-input">访问令牌</label>
+      <input id="token-input" name="token" type="password" autocomplete="off" spellcheck="false" placeholder="输入 x-miliastra-token" aria-describedby="token-hint token-error">
+      <p id="token-error" class="token-error" role="alert" hidden></p>
+      <p id="token-hint" class="hint">也可以打开带 <code>#token=…</code> 的链接自动导入；输入新令牌会替换当前令牌，留空保存则保持现有令牌。</p>
+      <div class="dialog-actions">
+        <button id="token-save" class="btn primary" type="submit">保存并连接</button>
+        <button id="setup-close" class="btn" type="button" hidden>取消</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  var TOKEN_KEY = 'miliastra-chat-observer.token';
+  var MAX_MESSAGES = 1000;
+  var MAX_DOM_ROWS = 500;
+  var MAX_SEEN = 4000;
+  var HEALTH_INTERVAL_MS = 5000;
+  var BACKFILL_RETRY_MS = 5000;
+  var SUCCESS_BANNER_MS = 4000;
+  var WS_LABEL = {
+    idle: '未连接',
+    connecting: '连接中',
+    connected: '已连接',
+    reconnecting: '重连中',
+    unauthorized: '令牌无效',
+    offline: '桥接离线'
+  };
+
+  function byId(id) { return document.getElementById(id); }
+
+  var ui = {
+    statusWs: byId('status-ws'),
+    statusGame: byId('status-game'),
+    statusHall: byId('status-hall'),
+    statusUptime: byId('status-uptime'),
+    statusSubs: byId('status-subs'),
+    statusLastid: byId('status-lastid'),
+    retry: byId('retry-countdown'),
+    btnSettings: byId('btn-settings'),
+    setup: byId('setup'),
+    tokenForm: byId('token-form'),
+    tokenInput: byId('token-input'),
+    tokenSave: byId('token-save'),
+    tokenError: byId('token-error'),
+    setupClose: byId('setup-close'),
+    banner: byId('banner'),
+    filterChannel: byId('filter-channel'),
+    filterText: byId('filter-text'),
+    follow: byId('follow'),
+    clear: byId('clear'),
+    count: byId('count'),
+    rate: byId('rate'),
+    messages: byId('messages'),
+    empty: byId('empty'),
+    emptyTitle: byId('empty-title'),
+    emptyHint: byId('empty-hint')
+  };
+
+  var token = '';
+  var socket = null;
+  var socketGen = 0;
+  var wsState = 'idle';
+  var bridgeOffline = false;
+  var unauthorized = false;
+  var reconnectAttempt = 0;
+  var reconnectTimer = null;
+  var countdownTimer = null;
+  var retryAt = 0;
+  var healthTimer = null;
+  var healthInFlight = false;
+  var backfillTimer = null;
+  var backfillInFlight = false;
+  var backfillQueued = false;
+  var rateTimer = null;
+  var bannerTimer = null;
+  var lastBackfillFailed = false;
+
+  var messageList = [];
+  var eventList = [];
+  var eventSeq = 0;
+  var seenIds = new Set();
+  var cursor = 0;
+  var lastServerLastId = 0;
+  var arrivals = [];
+  var hallKnown = false;
+  var lastHallKey = null;
+  var hasConnectedOnce = false;
+  var lastGame = null;
+  var shownMessages = 0;
+  var renderedRows = 0;
+  var ignoreScrollUntil = 0;
+
+  function pad2(n) {
+    return (n < 10 ? '0' : '') + n;
+  }
+
+  function toNumber(value) {
+    var n = Number(value);
+    return isFinite(n) ? n : 0;
+  }
+
+  function readStoredToken() {
+    try {
+      return localStorage.getItem(TOKEN_KEY) || '';
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function writeStoredToken(value) {
+    try {
+      localStorage.setItem(TOKEN_KEY, value);
+    } catch (err) {
+      /* 隐私模式下不可写，令牌仅保留在当前页面内存中 */
+    }
+  }
+
+  function adoptHashToken() {
+    var hash = location.hash || '';
+    if (hash.indexOf('#token=') !== 0) return;
+    var raw = hash.slice(7);
+    var value = raw;
+    try {
+      value = decodeURIComponent(raw);
+    } catch (err) {
+      value = raw;
+    }
+    value = value.replace(/^\s+|\s+$/g, '');
+    if (value) {
+      token = value;
+      writeStoredToken(value);
+    }
+    try {
+      history.replaceState(null, '', location.pathname + location.search);
+    } catch (err) {
+      try { location.hash = ''; } catch (err2) { /* 忽略 */ }
+    }
+  }
+
+  /*
+   * 桥接的大厅 ID 是 u64，可能超过 JS 安全整数范围。
+   * 在 JSON.parse 之前给字符串外的不安全整数加引号，避免精度丢失。
+   */
+  function parseJsonLossless(text) {
+    if (typeof text !== 'string' || text.length === 0) return null;
+    var out = '';
+    var inString = false;
+    var escaped = false;
+    var i = 0;
+    var len = text.length;
+    var maxSafe = BigInt(Number.MAX_SAFE_INTEGER);
+    while (i < len) {
+      var ch = text.charAt(i);
+      if (inString) {
+        out += ch;
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inString = true;
+        out += ch;
+        i++;
+        continue;
+      }
+      if (ch === '-' || (ch >= '0' && ch <= '9')) {
+        var start = i;
+        if (ch === '-') i++;
+        while (i < len && text.charAt(i) >= '0' && text.charAt(i) <= '9') i++;
+        var isInteger = true;
+        if (i < len && text.charAt(i) === '.') {
+          isInteger = false;
+          i++;
+          while (i < len && text.charAt(i) >= '0' && text.charAt(i) <= '9') i++;
+        }
+        if (i < len && (text.charAt(i) === 'e' || text.charAt(i) === 'E')) {
+          isInteger = false;
+          i++;
+          if (i < len && (text.charAt(i) === '+' || text.charAt(i) === '-')) i++;
+          while (i < len && text.charAt(i) >= '0' && text.charAt(i) <= '9') i++;
+        }
+        var tokenText = text.slice(start, i);
+        var unsafe = false;
+        if (isInteger) {
+          try {
+            var big = BigInt(tokenText);
+            unsafe = big > maxSafe || big < -maxSafe;
+          } catch (err) {
+            unsafe = tokenText.replace('-', '').length > 16;
+          }
+        }
+        out += unsafe ? '"' + tokenText + '"' : tokenText;
+        continue;
+      }
+      out += ch;
+      i++;
+    }
+    return JSON.parse(out);
+  }
+
+  async function requestJson(path, options) {
+    options = options || {};
+    var init = {
+      method: 'GET',
+      cache: 'no-store',
+      headers: options.headers || {}
+    };
+    var timer = null;
+    if (!options.signal && options.timeoutMs && typeof AbortController !== 'undefined') {
+      var controller = new AbortController();
+      init.signal = controller.signal;
+      timer = setTimeout(function () {
+        try { controller.abort(); } catch (err) { /* 忽略 */ }
+      }, options.timeoutMs);
+    } else if (options.signal) {
+      init.signal = options.signal;
+    }
+    try {
+      var response = await fetch(path, init);
+      var text = '';
+      try { text = await response.text(); } catch (err) { text = ''; }
+      var data = null;
+      if (text) {
+        try { data = parseJsonLossless(text); } catch (err) { data = null; }
+      }
+      return { status: response.status, ok: response.ok, data: data };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  function authHeaders() {
+    return { 'x-miliastra-token': token };
+  }
+
+  function wsUrl() {
+    var scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return scheme + '//' + location.host + '/stream?token=' + encodeURIComponent(token);
+  }
+
+  function effectiveWsState() {
+    if (unauthorized) return 'unauthorized';
+    if (bridgeOffline) return 'offline';
+    return wsState;
+  }
+
+  function tickCountdown() {
+    if (!reconnectTimer) {
+      ui.retry.hidden = true;
+      ui.retry.textContent = '';
+      return;
+    }
+    if (effectiveWsState() !== 'reconnecting') {
+      ui.retry.hidden = true;
+      return;
+    }
+    var left = Math.max(0, retryAt - Date.now());
+    ui.retry.textContent = left > 0 ? (left / 1000).toFixed(1) + 's 后重试' : '正在重试…';
+    ui.retry.hidden = false;
+  }
+
+  function applyWsState() {
+    var state = effectiveWsState();
+    ui.statusWs.setAttribute('data-state', state);
+    ui.statusWs.textContent = WS_LABEL[state] || WS_LABEL.idle;
+    var showRetry = state === 'reconnecting' && reconnectTimer !== null;
+    if (!showRetry) {
+      ui.retry.hidden = true;
+      ui.retry.textContent = '';
+    } else {
+      tickCountdown();
+    }
+  }
+
+  function setWsState(state) {
+    wsState = state;
+    applyWsState();
+  }
+
+  function setGame(connected) {
+    var state;
+    if (connected === true) {
+      state = 'connected';
+      ui.statusGame.textContent = '游戏已连接';
+    } else if (connected === false) {
+      state = 'disconnected';
+      ui.statusGame.textContent = '游戏未连接';
+    } else {
+      state = 'unknown';
+      ui.statusGame.textContent = '未知';
+    }
+    ui.statusGame.setAttribute('data-state', state);
+  }
+
+  function setHall(hall) {
+    if (!hall || hall.id === null || hall.id === undefined || hall.id === '') {
+      ui.statusHall.textContent = '未知';
+      ui.statusHall.setAttribute('data-state', 'unknown');
+      ui.statusHall.removeAttribute('title');
+      return 'null';
+    }
+    var id = String(hall.id);
+    var type = hall.type === null || hall.type === undefined ? null : String(hall.type);
+    ui.statusHall.textContent = type === null
+      ? id + '（类型未知）'
+      : id + '（类型 ' + type + '）';
+    ui.statusHall.setAttribute('data-state', 'known');
+    ui.statusHall.title = '大厅 ID ' + id + (type === null ? '' : '，类型 ' + type);
+    return id + ':' + (type === null ? '?' : type);
+  }
+
+  function hallSwitchText(id, type) {
+    var typeText = type === null || type === undefined ? '未知' : String(type);
+    return '大厅切换 → ' + String(id) + '（类型 ' + typeText + '）';
+  }
+
+  function applyHallFromHealth(hall) {
+    var key = setHall(hall);
+    var changed = hallKnown && key !== lastHallKey;
+    lastHallKey = key;
+    hallKnown = true;
+    if (changed && key !== 'null') {
+      addSysEvent('hall_changed', hallSwitchText(hall.id, hall.type));
+    }
+  }
+
+  function applyHallFromEvent(hallId, hallType) {
+    var hall = {
+      id: hallId,
+      type: hallType === null || hallType === undefined ? null : hallType
+    };
+    var key = setHall(hall);
+    var changed = !hallKnown || key !== lastHallKey;
+    lastHallKey = key;
+    hallKnown = true;
+    if (changed) {
+      addSysEvent('hall_changed', hallSwitchText(hall.id, hall.type));
+    }
+  }
+
+  function updateUptime(seconds) {
+    if (seconds === null || seconds === undefined) {
+      ui.statusUptime.textContent = '—';
+      ui.statusUptime.removeAttribute('title');
+      return;
+    }
+    var n = Math.max(0, Math.floor(toNumber(seconds)));
+    ui.statusUptime.title = n + ' 秒';
+    if (n < 60) {
+      ui.statusUptime.textContent = n + ' 秒';
+    } else if (n < 3600) {
+      ui.statusUptime.textContent = Math.floor(n / 60) + ' 分 ' + pad2(n % 60) + ' 秒';
+    } else {
+      ui.statusUptime.textContent = Math.floor(n / 3600) + ' 小时 ' + pad2(Math.floor((n % 3600) / 60)) + ' 分';
+    }
+  }
+
+  function updateLastId(value) {
+    if (value === null || value === undefined) {
+      ui.statusLastid.textContent = '0';
+      return;
+    }
+    if (typeof value === 'string' && /^-?[0-9]+$/.test(value) && value.replace('-', '').length > 15) {
+      ui.statusLastid.textContent = value;
+      return;
+    }
+    ui.statusLastid.textContent = String(toNumber(value));
+  }
+
+  function hideBanner() {
+    if (bannerTimer) {
+      clearTimeout(bannerTimer);
+      bannerTimer = null;
+    }
+    ui.banner.hidden = true;
+    ui.banner.textContent = '';
+    ui.banner.removeAttribute('data-kind');
+  }
+
+  function setBanner(kind, text) {
+    if (!text) {
+      hideBanner();
+      return;
+    }
+    var sameVisible = !ui.banner.hidden
+      && ui.banner.getAttribute('data-kind') === kind
+      && ui.banner.textContent === text;
+    if (sameVisible) return;
+    if (bannerTimer) {
+      clearTimeout(bannerTimer);
+      bannerTimer = null;
+    }
+    ui.banner.hidden = false;
+    ui.banner.setAttribute('data-kind', kind);
+    ui.banner.textContent = text;
+    if (kind === 'success' || kind === 'info') {
+      bannerTimer = setTimeout(function () {
+        bannerTimer = null;
+        ui.banner.hidden = true;
+        ui.banner.textContent = '';
+        ui.banner.removeAttribute('data-kind');
+      }, SUCCESS_BANNER_MS);
+    }
+  }
+
+  function setTokenError(message) {
+    if (message) {
+      ui.tokenError.textContent = message;
+      ui.tokenError.hidden = false;
+    } else {
+      ui.tokenError.textContent = '';
+      ui.tokenError.hidden = true;
+    }
+  }
+
+  function showSetup(message) {
+    ui.setup.hidden = false;
+    ui.setupClose.hidden = !token;
+    ui.tokenInput.value = '';
+    if (message) setTokenError(message);
+    else setTokenError('');
+    window.setTimeout(function () {
+      try { ui.tokenInput.focus(); } catch (err) { /* 忽略 */ }
+    }, 40);
+  }
+
+  function hideSetup() {
+    ui.setup.hidden = true;
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function stopCountdown() {
+    if (countdownTimer) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
+    ui.retry.hidden = true;
+    ui.retry.textContent = '';
+  }
+
+  function startCountdown() {
+    if (countdownTimer) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
+    tickCountdown();
+    countdownTimer = setInterval(tickCountdown, 200);
+  }
+
+  function stopReconnect() {
+    clearReconnectTimer();
+    stopCountdown();
+  }
+
+  function scheduleReconnect(fast) {
+    if (!token || unauthorized) return;
+    if (reconnectTimer) return;
+    var delay;
+    if (fast) {
+      delay = 300 + Math.floor(Math.random() * 300);
+    } else {
+      var exp = Math.min(reconnectAttempt, 5);
+      var base = Math.min(30000, 1000 * Math.pow(2, exp));
+      delay = Math.min(30000, base + Math.floor(Math.random() * Math.max(80, Math.floor(base * 0.15))));
+      reconnectAttempt++;
+    }
+    retryAt = Date.now() + delay;
+    reconnectTimer = setTimeout(function () {
+      reconnectTimer = null;
+      stopCountdown();
+      connectSocket();
+    }, delay);
+    setWsState('reconnecting');
+    startCountdown();
+  }
+
+  function closeSocket() {
+    socketGen++;
+    var old = socket;
+    socket = null;
+    if (!old) return;
+    old.onopen = null;
+    old.onmessage = null;
+    old.onerror = null;
+    old.onclose = null;
+    try { old.close(1000, 'client'); } catch (err) { /* 忽略 */ }
+  }
+
+  function connectSocket() {
+    if (!token || unauthorized) return;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+    clearReconnectTimer();
+    stopCountdown();
+    var gen = ++socketGen;
+    setWsState('connecting');
+    var next;
+    try {
+      next = new WebSocket(wsUrl());
+    } catch (err) {
+      scheduleReconnect(false);
+      return;
+    }
+    socket = next;
+    next.onopen = function () {
+      if (gen !== socketGen) return;
+      reconnectAttempt = 0;
+      setWsState('connected');
+      stopCountdown();
+      if (hasConnectedOnce) {
+        setBanner('success', '实时连接已恢复');
+      }
+      hasConnectedOnce = true;
+    };
+    next.onmessage = function (event) {
+      if (gen !== socketGen) return;
+      handleFrame(event.data);
+    };
+    next.onerror = function () { /* close 事件会跟进 */ };
+    next.onclose = function (event) {
+      if (gen !== socketGen) return;
+      socket = null;
+      stopCountdown();
+      setWsState('reconnecting');
+      if (event && event.code === 1013) {
+        reconnectAttempt = 0;
+        void runBackfill();
+        scheduleReconnect(true);
+      } else {
+        scheduleReconnect(false);
+      }
+    };
+  }
+
+  function ensureConnect() {
+    if (!token || unauthorized) return;
+    if (reconnectTimer) {
+      clearReconnectTimer();
+      stopCountdown();
+    }
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      applyWsState();
+      return;
+    }
+    connectSocket();
+  }
+
+  function handleFrame(raw) {
+    var event;
+    try {
+      event = parseJsonLossless(typeof raw === 'string' ? raw : '');
+    } catch (err) {
+      return;
+    }
+    if (!event || typeof event !== 'object') return;
+    if (event.type === 'hello') {
+      handleHello(event);
+    } else if (event.type === 'message') {
+      processMessage(event.message);
+    } else if (event.type === 'hall_changed') {
+      applyHallFromEvent(event.hallId, event.hallType);
+    }
+  }
+
+  function detectRestart(serverLast) {
+    var local = toNumber(cursor);
+    if (local > 0 && serverLast < local) {
+      resetSession();
+      return true;
+    }
+    return false;
+  }
+
+  function resetSession() {
+    messageList = [];
+    eventList = [];
+    eventSeq = 0;
+    seenIds = new Set();
+    arrivals = [];
+    cursor = 0;
+    lastServerLastId = 0;
+    hallKnown = false;
+    lastHallKey = null;
+    setHall(null);
+    updateLastId(0);
+    addSysEvent('restart', '桥接已重启，消息序号重置');
+    updateRate();
+  }
+
+  function handleHello(event) {
+    var helloLast = toNumber(event.lastMessageId);
+    var restarted = detectRestart(helloLast);
+    lastServerLastId = helloLast;
+    updateLastId(helloLast);
+    if (restarted) {
+      setBanner('info', '桥接已重启，已按新序号重新同步');
+    }
+    /* 重连/重启后不必等下一个 5s 轮询才刷新游戏与大厅状态 */
+    void pollHealth();
+    void runBackfill();
+  }
+
+  function processMessage(message) {
+    if (!message || typeof message !== 'object') return;
+    var id = message.id;
+    if (id === null || id === undefined) return;
+    var key = String(id);
+    if (seenIds.has(key)) return;
+    seenIds.add(key);
+    if (seenIds.size > MAX_SEEN) {
+      var extra = seenIds.size - Math.floor(MAX_SEEN / 2);
+      var iterator = seenIds.values();
+      while (extra > 0) {
+        var step = iterator.next();
+        if (step.done) break;
+        seenIds.delete(step.value);
+        extra--;
+      }
+    }
+    var numId = toNumber(id);
+    var from = message.from && typeof message.from === 'object' ? message.from : {};
+    var normalized = {
+      id: id,
+      ts: message.ts,
+      channel: message.channel === 'private' ? 'private' : 'current_hall',
+      hallId: message.hallId === undefined ? null : message.hallId,
+      hallType: message.hallType === undefined ? null : message.hallType,
+      from: {
+        uid: from.uid === undefined ? null : from.uid,
+        name: typeof from.name === 'string' ? from.name : null
+      },
+      to: message.to === undefined ? null : message.to,
+      text: typeof message.text === 'string' ? message.text : ''
+    };
+    var index = messageList.length;
+    while (index > 0 && toNumber(messageList[index - 1].id) > numId) index--;
+    messageList.splice(index, 0, normalized);
+    if (messageList.length > MAX_MESSAGES) {
+      messageList.splice(0, messageList.length - MAX_MESSAGES);
+    }
+    if (numId > toNumber(cursor)) cursor = numId;
+    if (numId > lastServerLastId) {
+      lastServerLastId = numId;
+      updateLastId(numId);
+    }
+    arrivals.push(Date.now());
+    render();
+  }
+
+  function addSysEvent(name, text) {
+    eventList.push({
+      event: name,
+      text: text,
+      anchor: toNumber(cursor),
+      seq: eventSeq++
+    });
+    if (eventList.length > 200) {
+      eventList.splice(0, eventList.length - 200);
+    }
+    render();
+  }
+
+  function formatClock(ts) {
+    var date = new Date(toNumber(ts) * 1000);
+    if (!isFinite(date.getTime())) return '--:--:--';
+    return pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' + pad2(date.getSeconds());
+  }
+
+  function channelOf(message) {
+    return message.channel === 'private' ? 'private' : 'current_hall';
+  }
+
+  function channelLabel(channel) {
+    return channel === 'private' ? '私聊' : '大厅';
+  }
+
+  function buildMessageRow(message) {
+    var channel = channelOf(message);
+    var row = document.createElement('div');
+    row.className = 'msg';
+    row.setAttribute('data-msg-id', String(message.id));
+    row.setAttribute('data-channel', channel);
+
+    var time = document.createElement('span');
+    time.className = 'msg-time';
+    time.textContent = formatClock(message.ts);
+
+    var badge = document.createElement('span');
+    badge.className = 'msg-channel';
+    badge.setAttribute('data-channel', channel);
+    badge.textContent = channelLabel(channel);
+
+    var sender = document.createElement('span');
+    sender.className = 'msg-sender';
+    var from = message.from && typeof message.from === 'object' ? message.from : {};
+    var uid = from.uid === null || from.uid === undefined ? '' : String(from.uid);
+    var name = typeof from.name === 'string' ? from.name : '';
+    sender.textContent = name ? name : (uid ? 'UID ' + uid : '未知发送者');
+    sender.title = uid ? 'UID ' + uid : 'UID 未知';
+
+    var text = document.createElement('span');
+    text.className = 'msg-text';
+    text.textContent = typeof message.text === 'string' ? message.text : '';
+
+    row.appendChild(time);
+    row.appendChild(badge);
+    row.appendChild(sender);
+    row.appendChild(text);
+    return row;
+  }
+
+  function buildSystemRow(entry) {
+    var row = document.createElement('div');
+    row.className = 'sys';
+    row.setAttribute('data-event', entry.event);
+    row.textContent = entry.text;
+    return row;
+  }
+
+  function updateCount() {
+    ui.count.textContent = '共 ' + messageList.length + ' 条 · 显示 ' + shownMessages + ' 条';
+  }
+
+  function updateEmptyState() {
+    var noMessages = messageList.length === 0;
+    var nothingVisible = shownMessages === 0 && renderedRows === 0;
+    var show = noMessages || nothingVisible;
+    ui.empty.hidden = !show;
+    if (!show) return;
+    if (noMessages) {
+      ui.emptyTitle.textContent = '等待检测到消息…';
+      ui.emptyHint.textContent = '请确认游戏已启动且注入成功。';
+    } else {
+      ui.emptyTitle.textContent = '没有匹配的消息';
+      ui.emptyHint.textContent = '调整频道或搜索关键词后重试。';
+    }
+  }
+
+  function render() {
+    var channel = ui.filterChannel.value;
+    var query = ui.filterText.value.replace(/^\s+|\s+$/g, '').toLowerCase();
+    var filtered = [];
+    var i;
+    for (i = 0; i < messageList.length; i++) {
+      var message = messageList[i];
+      if (channel !== 'all' && channelOf(message) !== channel) continue;
+      if (query) {
+        var from = message.from || {};
+        var name = typeof from.name === 'string' ? from.name : '';
+        var uid = from.uid === null || from.uid === undefined ? '' : String(from.uid);
+        var text = typeof message.text === 'string' ? message.text : '';
+        if (name.toLowerCase().indexOf(query) === -1
+          && uid.indexOf(query) === -1
+          && text.toLowerCase().indexOf(query) === -1) {
+          continue;
+        }
+      }
+      filtered.push(message);
+    }
+
+    var events = eventList.slice().sort(function (a, b) {
+      return (a.anchor - b.anchor) || (a.seq - b.seq);
+    });
+    var ordered = [];
+    var eventIndex = 0;
+    for (i = 0; i < filtered.length; i++) {
+      var mid = toNumber(filtered[i].id);
+      while (eventIndex < events.length && events[eventIndex].anchor < mid) {
+        ordered.push({ sys: events[eventIndex] });
+        eventIndex++;
+      }
+      ordered.push({ msg: filtered[i] });
+    }
+    while (eventIndex < events.length) {
+      ordered.push({ sys: events[eventIndex] });
+      eventIndex++;
+    }
+
+    var start = ordered.length > MAX_DOM_ROWS ? ordered.length - MAX_DOM_ROWS : 0;
+    var stick = ui.follow.checked;
+    var list = ui.messages;
+    var distance = list.scrollHeight - list.scrollTop - list.clientHeight;
+    var fragment = document.createDocumentFragment();
+    var shown = 0;
+    var rows = 0;
+    for (i = start; i < ordered.length; i++) {
+      if (ordered[i].msg) {
+        fragment.appendChild(buildMessageRow(ordered[i].msg));
+        shown++;
+      } else {
+        fragment.appendChild(buildSystemRow(ordered[i].sys));
+      }
+      rows++;
+    }
+    ignoreScrollUntil = Date.now() + 160;
+    list.replaceChildren(fragment);
+    shownMessages = shown;
+    renderedRows = rows;
+    if (stick) {
+      list.scrollTop = list.scrollHeight;
+    } else {
+      var maxTop = Math.max(0, list.scrollHeight - list.clientHeight);
+      var target = list.scrollHeight - list.clientHeight - distance;
+      list.scrollTop = Math.max(0, Math.min(maxTop, target));
+    }
+    updateCount();
+    updateEmptyState();
+  }
+
+  function clearLocal() {
+    messageList = [];
+    eventList = [];
+    eventSeq = 0;
+    seenIds = new Set();
+    arrivals = [];
+    render();
+    updateRate();
+  }
+
+  function updateRate() {
+    var cutoff = Date.now() - 60000;
+    var removed = 0;
+    while (removed < arrivals.length && arrivals[removed] < cutoff) removed++;
+    if (removed > 0) arrivals.splice(0, removed);
+    ui.rate.textContent = String(arrivals.length);
+  }
+
+  function scheduleBackfillRetry() {
+    if (backfillTimer) return;
+    backfillTimer = setTimeout(function () {
+      backfillTimer = null;
+      void runBackfill();
+    }, BACKFILL_RETRY_MS);
+  }
+
+  function clearBackfillRetry() {
+    if (backfillTimer) {
+      clearTimeout(backfillTimer);
+      backfillTimer = null;
+    }
+  }
+
+  async function runBackfill() {
+    if (!token || unauthorized) return;
+    if (backfillInFlight) {
+      backfillQueued = true;
+      return;
+    }
+    backfillInFlight = true;
+    var since = cursor;
+    var truncatedShown = false;
+    var hadFailure = lastBackfillFailed;
+    try {
+      for (var page = 0; page < 50; page++) {
+        var result = await requestJson(
+          '/messages?since=' + encodeURIComponent(String(since)) + '&limit=1000',
+          { headers: authHeaders(), timeoutMs: 12000 }
+        );
+        if (result.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        if (result.status === 503) {
+          lastBackfillFailed = true;
+          setBanner('error', '游戏未连接，等待注入恢复');
+          scheduleBackfillRetry();
+          return;
+        }
+        if (!result.ok || !result.data) {
+          lastBackfillFailed = true;
+          setBanner('error', '补拉历史消息失败，稍后重试');
+          scheduleBackfillRetry();
+          return;
+        }
+        var data = result.data;
+        if (data.truncated === true && !truncatedShown) {
+          truncatedShown = true;
+          addSysEvent('truncated', '部分历史消息已被淘汰');
+        }
+        var list = Array.isArray(data.messages) ? data.messages : [];
+        for (var i = 0; i < list.length; i++) processMessage(list[i]);
+        var reported = data.lastMessageId === undefined || data.lastMessageId === null
+          ? null
+          : toNumber(data.lastMessageId);
+        if (reported !== null) {
+          if (reported > lastServerLastId) lastServerLastId = reported;
+          updateLastId(Math.max(lastServerLastId, toNumber(cursor)));
+        }
+        if (list.length === 0) break;
+        var last = list[list.length - 1];
+        var lastId = toNumber(last.id);
+        if (lastId <= toNumber(since)) break;
+        since = last.id;
+        if (list.length >= 1000 && reported !== null && reported > lastId) continue;
+        break;
+      }
+      clearBackfillRetry();
+      lastBackfillFailed = false;
+      if (truncatedShown) {
+        setBanner('error', '部分历史消息已被淘汰');
+      } else if (hadFailure) {
+        setBanner('success', '历史消息已补齐');
+      }
+    } catch (err) {
+      if (!unauthorized) {
+        lastBackfillFailed = true;
+        setBanner('error', '补拉历史消息失败，稍后重试');
+        scheduleBackfillRetry();
+      }
+    } finally {
+      backfillInFlight = false;
+      if (backfillQueued && !unauthorized) {
+        backfillQueued = false;
+        void runBackfill();
+      }
+    }
+  }
+
+  function handleUnauthorized() {
+    if (unauthorized) return;
+    unauthorized = true;
+    bridgeOffline = false;
+    stopReconnect();
+    closeSocket();
+    if (healthTimer) {
+      clearInterval(healthTimer);
+      healthTimer = null;
+    }
+    clearBackfillRetry();
+    applyWsState();
+    showSetup('令牌无效，请检查后重新输入。');
+    setBanner('error', '令牌无效，实时连接已停止');
+  }
+
+  function handleHealthUnreachable() {
+    if (unauthorized) return;
+    bridgeOffline = true;
+    setGame(null);
+    lastGame = null;
+    ui.statusUptime.textContent = '—';
+    ui.statusUptime.removeAttribute('title');
+    ui.statusSubs.textContent = '—';
+    setBanner('error', '桥接离线，正在等待恢复…');
+    applyWsState();
+    if ((!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING)
+      && !reconnectTimer) {
+      scheduleReconnect(false);
+    }
+  }
+
+  function applyHealth(data) {
+    var recovered = bridgeOffline;
+    bridgeOffline = false;
+    var game = data.gameConnected;
+    var gameConnected = game === true ? true : (game === false ? false : null);
+    var previousGame = lastGame;
+    setGame(gameConnected);
+    lastGame = gameConnected;
+    if (gameConnected === false) {
+      setBanner('error', '游戏未连接，等待注入恢复');
+    } else if (gameConnected === true && previousGame === false) {
+      setBanner('success', '游戏已连接');
+    }
+
+    if (typeof data.uptimeSec === 'number') updateUptime(data.uptimeSec);
+    else updateUptime(null);
+    ui.statusSubs.textContent = typeof data.subscribers === 'number' ? String(data.subscribers) : '—';
+
+    if (data.lastMessageId !== undefined && data.lastMessageId !== null) {
+      var reported = toNumber(data.lastMessageId);
+      var restarted = detectRestart(reported);
+      if (restarted) {
+        lastServerLastId = reported;
+        updateLastId(reported);
+        setBanner('info', '桥接已重启，已按新序号重新同步');
+        void runBackfill();
+      } else {
+        if (reported > lastServerLastId) lastServerLastId = reported;
+        updateLastId(Math.max(lastServerLastId, toNumber(cursor)));
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(data, 'currentHall')) {
+      applyHallFromHealth(data.currentHall);
+    }
+
+    if (recovered) {
+      if (gameConnected !== false) setBanner('success', '桥接已恢复');
+      ensureConnect();
+    }
+    if (gameConnected === true && backfillTimer) {
+      clearBackfillRetry();
+      void runBackfill();
+    }
+    applyWsState();
+  }
+
+  async function pollHealth() {
+    if (!token || unauthorized || healthInFlight) return;
+    healthInFlight = true;
+    try {
+      var result = await requestJson('/health', { headers: authHeaders(), timeoutMs: 8000 });
+      if (result.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      if (!result.ok || !result.data) {
+        handleHealthUnreachable();
+        return;
+      }
+      applyHealth(result.data);
+    } catch (err) {
+      if (!unauthorized) handleHealthUnreachable();
+    } finally {
+      healthInFlight = false;
+    }
+  }
+
+  function startAll() {
+    unauthorized = false;
+    bridgeOffline = false;
+    reconnectAttempt = 0;
+    if (healthTimer) {
+      clearInterval(healthTimer);
+      healthTimer = null;
+    }
+    healthTimer = setInterval(pollHealth, HEALTH_INTERVAL_MS);
+    applyWsState();
+    pollHealth();
+    ensureConnect();
+    if (!rateTimer) {
+      rateTimer = setInterval(updateRate, 1000);
+    }
+  }
+
+  function saveToken() {
+    var value = ui.tokenInput.value.replace(/^\s+|\s+$/g, '');
+    if (!value) {
+      if (token) {
+        hideSetup();
+        return;
+      }
+      setTokenError('请输入访问令牌。');
+      return;
+    }
+    token = value;
+    writeStoredToken(value);
+    setTokenError('');
+    hideSetup();
+    closeSocket();
+    stopReconnect();
+    clearBackfillRetry();
+    if (healthTimer) {
+      clearInterval(healthTimer);
+      healthTimer = null;
+    }
+    unauthorized = false;
+    bridgeOffline = false;
+    reconnectAttempt = 0;
+    startAll();
+  }
+
+  function setFollow(value) {
+    if (ui.follow.checked === value) return;
+    ui.follow.checked = value;
+  }
+
+  function onMessagesScroll() {
+    if (Date.now() < ignoreScrollUntil) return;
+    var list = ui.messages;
+    var gap = list.scrollHeight - list.scrollTop - list.clientHeight;
+    if (gap > 16 && ui.follow.checked) {
+      ui.follow.checked = false;
+    }
+  }
+
+  function scrollToBottom() {
+    ignoreScrollUntil = Date.now() + 150;
+    ui.messages.scrollTop = ui.messages.scrollHeight;
+  }
+
+  function bindEvents() {
+    ui.tokenForm.addEventListener('submit', function (event) {
+      event.preventDefault();
+      saveToken();
+    });
+    ui.btnSettings.addEventListener('click', function () {
+      showSetup('');
+    });
+    ui.setupClose.addEventListener('click', function () {
+      if (token) hideSetup();
+    });
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Escape') return;
+      if (!ui.setup.hidden && token) {
+        hideSetup();
+        try { ui.btnSettings.focus(); } catch (err) { /* 忽略 */ }
+      }
+    });
+    ui.filterChannel.addEventListener('change', render);
+    ui.filterText.addEventListener('input', render);
+    ui.follow.addEventListener('change', function () {
+      if (ui.follow.checked) scrollToBottom();
+    });
+    ui.clear.addEventListener('click', clearLocal);
+    ui.messages.addEventListener('scroll', onMessagesScroll, { passive: true });
+    ui.messages.addEventListener('wheel', function (event) {
+      if (event.deltaY < 0) setFollow(false);
+    }, { passive: true });
+    ui.messages.addEventListener('keydown', function (event) {
+      if (event.key === 'PageUp' || event.key === 'Home' || event.key === 'ArrowUp') {
+        setFollow(false);
+      }
+    });
+    window.addEventListener('online', function () {
+      void pollHealth();
+    });
+  }
+
+  function init() {
+    adoptHashToken();
+    if (!token) token = readStoredToken();
+    applyWsState();
+    setGame(null);
+    setHall(null);
+    updateUptime(null);
+    updateLastId(0);
+    ui.statusSubs.textContent = '—';
+    bindEvents();
+    render();
+    updateRate();
+    if (!token) {
+      showSetup('');
+    } else {
+      hideSetup();
+      startAll();
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

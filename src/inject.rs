@@ -1156,9 +1156,10 @@ mod tests {
         .encode_utf16()
         .chain(Some(0))
         .collect();
-        let pipe = create_named_pipe(&name).unwrap();
+        let access = windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        let pipe = create_named_pipe(&name, access).unwrap();
         // FIRST_PIPE_INSTANCE 检测冲突不需要客户端 CreateFile，因此连接仍留给DLL。
-        assert!(create_named_pipe(&name).is_err());
+        assert!(create_named_pipe(&name, access).is_err());
         let proc = suspended_cmd();
         // 已取消时不进入阻塞的 ConnectNamedPipe。
         let cancelled = AtomicBool::new(true);

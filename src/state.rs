@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
 
-use crate::extract::RawChat;
+use crate::extract::{FriendProfile, RawChat};
 use crate::model::{Channel, ChatMessage, Sender, ServerEvent};
 
 /// 消息缓冲容量。
@@ -37,8 +37,16 @@ struct Inner {
     current_hall: Option<(u64, u32)>,
     messages: VecDeque<ChatMessage>,
     names: BTreeMap<u32, String>,
+    /// 好友备注（4410 的 #17）。与昵称分开存：备注是玩家自己起的名字，
+    /// 可随时清空或改写，绝不能拿来当身份判断。
+    remarks: BTreeMap<u32, String>,
     /// 已推送的最大 id。
     last_id: u64,
+    /// 是否已收到过 4410 好友列表。
+    ///
+    /// 4410 在进游戏时全量下发一次，之后只有懒加载增量；协议里没有快照/增量
+    /// 标记字段，所以只能按时序区分：第一次收到的当全量基线，之后都当增量合并。
+    friend_list_seen: bool,
 }
 
 impl ChatState {
@@ -50,7 +58,9 @@ impl ChatState {
                 current_hall: None,
                 messages: VecDeque::new(),
                 names: BTreeMap::new(),
+                remarks: BTreeMap::new(),
                 last_id: 0,
+                friend_list_seen: false,
             }),
             tx,
             self_uid,
@@ -88,6 +98,43 @@ impl ChatState {
         for (uid, name) in pairs {
             inner.names.insert(uid, name);
         }
+    }
+
+    /// 合并好友档案（4410）：昵称与备注各写各的。
+    ///
+    /// 这张表只在进游戏时全量来一次，之后都是懒加载的增量；所以合并必须
+    /// 只增不删——某次增量里没提到的 UID，不能把它已有的备注抹掉。
+    /// 备注为空、或本条记录根本没带 #17 时，保留原值。
+    /// 返回本次是否建立了全量基线（用于日志区分“首次全量”与“懒加载增量”）。
+    pub async fn record_friend_profiles(&self, profiles: Vec<FriendProfile>) -> bool {
+        if profiles.is_empty() {
+            return false;
+        }
+        let mut inner = self.inner.write().await;
+        let baseline = !inner.friend_list_seen;
+        inner.friend_list_seen = true;
+        for profile in profiles {
+            if let Some(name) = profile.name {
+                inner.names.insert(profile.uid, name);
+            }
+            if let Some(remark) = profile.remark {
+                inner.remarks.insert(profile.uid, remark);
+            }
+        }
+        baseline
+    }
+
+    /// 备注表规模，供诊断接口观察是否已经收到过全量基线。
+    pub async fn remark_count(&self) -> usize {
+        self.inner.read().await.remarks.len()
+    }
+
+    /// 批量查备注。没有备注的 UID 不返回，调用方据此区分“没设备注”与“空备注”。
+    pub async fn remarks(&self, uids: &[u32]) -> BTreeMap<u32, String> {
+        let inner = self.inner.read().await;
+        uids.iter()
+            .filter_map(|uid| inner.remarks.get(uid).map(|remark| (*uid, remark.clone())))
+            .collect()
     }
 
     /// 批量查昵称。
@@ -407,5 +454,115 @@ mod tests {
         state.ingest(vec![raw("hi", 1, Some(100), false)]).await;
         let (msgs, _, _) = state.messages_since(0, 10).await;
         assert_eq!(msgs[0].from.name.as_deref(), Some("洛"));
+    }
+
+    fn profile(uid: u32, name: Option<&str>, remark: Option<&str>) -> FriendProfile {
+        FriendProfile {
+            uid,
+            name: name.map(str::to_owned),
+            remark: remark.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn friend_profiles_fill_names_and_remarks_separately() {
+        let state = ChatState::new(999);
+        state
+            .record_friend_profiles(vec![
+                profile(100000001, Some("甲玩家"), Some("rmkAAA1")),
+                profile(100000002, Some("乙玩家"), None),
+            ])
+            .await;
+        let names = state.names(&[100000001, 100000002]).await;
+        assert_eq!(names[&100000001].as_deref(), Some("甲玩家"));
+        assert_eq!(names[&100000002].as_deref(), Some("乙玩家"));
+        // 没设备注的 UID 不出现在备注表里，不能被当成空串。
+        let remarks = state.remarks(&[100000001, 100000002]).await;
+        assert_eq!(remarks.get(&100000001).map(String::as_str), Some("rmkAAA1"));
+        assert!(!remarks.contains_key(&100000002));
+    }
+
+    /// 进游戏全量一次、之后懒加载增量：增量里没提到的条目不能被抹掉。
+    #[tokio::test]
+    async fn lazy_refresh_keeps_previous_remarks() {
+        let state = ChatState::new(999);
+        state
+            .record_friend_profiles(vec![
+                profile(1, Some("甲"), Some("备注甲")),
+                profile(2, Some("乙"), Some("备注乙")),
+            ])
+            .await;
+        // 懒加载只带回第二个人的昵称，且没带 #17。
+        state
+            .record_friend_profiles(vec![profile(2, Some("乙改名"), None)])
+            .await;
+        let remarks = state.remarks(&[1, 2]).await;
+        assert_eq!(remarks.get(&1).map(String::as_str), Some("备注甲"));
+        assert_eq!(remarks.get(&2).map(String::as_str), Some("备注乙"));
+        let names = state.names(&[2]).await;
+        assert_eq!(names[&2].as_deref(), Some("乙改名"));
+    }
+
+    #[tokio::test]
+    async fn first_friend_list_is_baseline_and_later_ones_are_incremental() {
+        let state = ChatState::new(999);
+        assert_eq!(state.remark_count().await, 0);
+        let baseline = state
+            .record_friend_profiles(vec![
+                profile(1, Some("甲"), Some("备注甲")),
+                profile(2, Some("乙"), None),
+            ])
+            .await;
+        assert!(baseline, "首次 4410 应视为全量基线");
+        assert_eq!(state.remark_count().await, 1);
+        let baseline = state
+            .record_friend_profiles(vec![profile(3, Some("丙"), Some("备注丙"))])
+            .await;
+        assert!(!baseline, "之后的 4410 是懒加载增量");
+        assert_eq!(state.remark_count().await, 2);
+        // 空批次不改状态，也不该把首次基线“用掉”。
+        let empty = ChatState::new(999);
+        assert!(!empty.record_friend_profiles(Vec::new()).await);
+        assert!(
+            empty
+                .record_friend_profiles(vec![profile(1, Some("甲"), None)])
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn remarks_win_over_older_value_but_never_become_empty() {
+        let state = ChatState::new(999);
+        state
+            .record_friend_profiles(vec![profile(1, None, Some("旧备注"))])
+            .await;
+        // 在游戏里改了备注：新值覆盖旧值。
+        state
+            .record_friend_profiles(vec![profile(1, None, Some("新备注"))])
+            .await;
+        assert_eq!(
+            state.remarks(&[1]).await.get(&1).map(String::as_str),
+            Some("新备注")
+        );
+        // 只有昵称的增量不会清掉备注。
+        state
+            .record_friend_profiles(vec![profile(1, Some("甲"), None)])
+            .await;
+        assert_eq!(
+            state.remarks(&[1]).await.get(&1).map(String::as_str),
+            Some("新备注")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_sender_name_ignores_remarks() {
+        let state = ChatState::new(999);
+        state
+            .record_friend_profiles(vec![profile(1, Some("昵称"), Some("备注"))])
+            .await;
+        state.ingest(vec![raw("hi", 1, Some(100), false)]).await;
+        let (msgs, _, _) = state.messages_since(0, 10).await;
+        // 消息只带昵称：备注是不能作为身份判断的展示名。
+        assert_eq!(msgs[0].from.name.as_deref(), Some("昵称"));
     }
 }

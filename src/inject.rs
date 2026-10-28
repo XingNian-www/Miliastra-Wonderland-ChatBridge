@@ -295,6 +295,31 @@ fn serve_once(
 }
 
 fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
+    // 好友列表走独立 cmd，结构既不是信封也不是消息体，单独处理。
+    if cmd == extract::CMD_FRIEND_LIST {
+        let profiles = extract::extract_friend_profiles(payload);
+        if profiles.is_empty() {
+            return;
+        }
+        // 只在进游戏全量那次有几十条；懒加载增量通常一两条。
+        let remarked = profiles.iter().filter(|p| p.remark.is_some()).count();
+        let total = profiles.len();
+        tokio::runtime::Handle::current().block_on(async {
+            let baseline = chat.record_friend_profiles(profiles).await;
+            tracing::info!(
+                "4410 好友列表{}: {} 条记录，其中 {} 条带备注，累计备注 {} 条",
+                if baseline {
+                    "（全量基线）"
+                } else {
+                    "（增量"
+                },
+                total,
+                remarked,
+                chat.remark_count().await
+            );
+        });
+        return;
+    }
     // 独立 486 只承载私聊；信封 2246 才有多路复用内容。
     let (halls, names, population, chats) = if cmd == extract::CMD_PRIVATE_DIRECT {
         (

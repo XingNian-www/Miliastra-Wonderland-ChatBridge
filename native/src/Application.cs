@@ -10,6 +10,10 @@ namespace MiliastraWonderlandChatBridge;
 ///
 /// 与上游 YaeAchievement 相比，这里删掉了成就、玩家属性、自动点击开始按钮等功能——
 /// 本项目只需要聊天数据。协议层（管道握手、方法表）保持完全兼容。
+///
+/// 可选增强：宿主可通过控制管道打开 "debug 全包模式"，此时除聊天包外，所有合法包
+/// 还会额外复制一份到独立的 debug 管道（见 <see cref="ModeControl"/> /
+/// <see cref="DebugOutbox"/>）。聊天通道的队列容量、ACK 协议与发送线程完全不变。
 /// </summary>
 internal static unsafe class Application {
 
@@ -25,6 +29,14 @@ internal static unsafe class Application {
             Log.UseConsoleOutput();
             Log.Trace("~");
             Goshujin.Init();
+            // 可选增强通道：连接在后台线程进行，旧宿主没有管道时 5s 超时后仅停用增强功能。
+            // 再包一层 try：即使线程都起不来（极端资源耗尽），也绝不能影响注入与聊天。
+            try {
+                ModeControl.Start();
+                DebugOutbox.Start();
+            } catch (Exception ex) {
+                Log.Warn($"debug/control 通道启动失败，保持 chat 模式: {ex.Message}");
+            }
             Goshujin.LoadTasks();
             Goshujin.LoadProps();
             Goshujin.LoadMethodTable();
@@ -66,6 +78,21 @@ internal static unsafe class Application {
     // Must match the host pipe protocol MAX_PAYLOAD (1 MiB).
     internal const uint MaxPacketDataLength = 1024 * 1024;
 
+    /// <summary>宿主是否订阅了这个 cmd。保持与原有实现相同的锁语义。</summary>
+    internal static bool IsRequired(ushort cmdId) {
+        lock (RequiredPackets) {
+            return RequiredPackets.Contains(cmdId);
+        }
+    }
+
+    /// <summary>
+    /// 过滤判定：聊天包在 chat/all 两种模式下都转发；其它包只在 debug 全包模式
+    /// （<see cref="ModeControl.AllPackets"/>）下转发。钩子为了区分两个通道会分别
+    /// 读取这两项，这里供回归测试验证过滤语义。
+    /// </summary>
+    internal static bool ShouldForward(ushort cmdId) =>
+        IsRequired(cmdId) || ModeControl.AllPackets;
+
     [UnmanagedCallersOnly]
     private static int OnToInt32(byte* val, int startIndex) {
         var original = (delegate* unmanaged<byte*, int, int>) Volatile.Read(ref _toInt32);
@@ -88,14 +115,23 @@ internal static unsafe class Application {
                 return ret;
             }
             var cmdId = BinaryPrimitives.ReverseEndianness(*(ushort*) (val + 2));
-            lock (RequiredPackets) {
-                if (!RequiredPackets.Contains(cmdId)) {
-                    return ret;
-                }
+            // RequiredPackets 查询保持原锁；AllPackets 是 volatile 读，放锁外避免每条包争锁。
+            var required = IsRequired(cmdId);
+            var allPackets = ModeControl.AllPackets;
+            if (!required && !allPackets) {
+                return ret;
             }
             if (TryGetData(val, (int) packetLength, out var data, out unzipBuf)) {
                 // 只复制并入队，立即返回：这一步绝不能碰管道。
-                PacketOutbox.Enqueue(cmdId, data.ToArray());
+                if (required) {
+                    PacketOutbox.Enqueue(cmdId, data.ToArray());
+                }
+                if (allPackets && !DebugOutbox.Disabled) {
+                    // debug 通道只入队/计数，不做 IO；写失败由后台线程单独停用，不影响聊天。
+                    // 停用后不再复制（ToArray 在游戏网络线程上，白复制只增加 GC 压力）。
+                    // TryGetData 已按 MaxPacketDataLength(1 MiB) 过滤，debug 包与聊天包同一上限。
+                    DebugOutbox.Enqueue(cmdId, data.ToArray());
+                }
             }
         } catch (Exception ex) when (
             // InvalidDataException 与 IOException 是兄弟（都继承 SystemException），

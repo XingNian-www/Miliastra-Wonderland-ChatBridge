@@ -12,6 +12,7 @@ mod diag;
 mod extract;
 mod metadata;
 mod model;
+mod packet_control;
 mod pipe;
 mod proto;
 mod server;
@@ -64,6 +65,25 @@ fn main() -> Result<()> {
 
     let chat = state::ChatState::new(cfg.self_uid);
     let connected = Arc::new(AtomicBool::new(false));
+    let packets = packet_control::PacketControl::new(
+        if args.debug_packets {
+            packet_control::PacketMode::All
+        } else {
+            packet_control::PacketMode::Chat
+        },
+        args.capture_dir
+            .clone()
+            .map(|dir| packet_control::CaptureConfig {
+                dir,
+                max_bytes: args.capture_max_mib.saturating_mul(1024 * 1024),
+            }),
+    );
+    if let Some(dir) = args.capture_dir.as_deref() {
+        tracing::info!(
+            "raw 抓包目录: {}（debug 模式收到全包后写入；每次启动重建 index.csv）",
+            dir.display()
+        );
+    }
     let app = Arc::new(server::AppState {
         chat: Arc::clone(&chat),
         token: cfg.token.clone(),
@@ -71,6 +91,7 @@ fn main() -> Result<()> {
         connected: Arc::clone(&connected),
         port: cfg.port,
         self_uid: cfg.self_uid,
+        packets: Arc::clone(&packets),
     });
 
     let result = runtime.block_on(async move {
@@ -86,7 +107,7 @@ fn main() -> Result<()> {
             let cancelled = Arc::clone(&cancelled);
             async move {
                 if !args.auto_launch { return std::future::pending::<Result<()>>().await; }
-                inject::run(chat, connected, args.auto_launch, args.spawn_only, args.lib_only, cancelled).await
+                inject::run(chat, connected, Arc::clone(&packets), args.auto_launch, args.spawn_only, args.lib_only, cancelled).await
             }
         };
         #[cfg(not(windows))]
@@ -396,6 +417,12 @@ mod clap_free_args {
         pub no_log_file: bool,
         /// 只做启动前自检并退出，不启动游戏。
         pub diagnose: bool,
+        /// debug 模式初始为 all；不持久化，推荐运行时通过 API 切换。
+        pub debug_packets: bool,
+        /// raw 抓包目录；只在显式配置时落盘。
+        pub capture_dir: Option<PathBuf>,
+        /// raw 抓包总字节上限（MiB），默认 1024。
+        pub capture_max_mib: u64,
     }
 
     impl Args {
@@ -410,6 +437,9 @@ mod clap_free_args {
             let mut log_file: Option<PathBuf> = None;
             let mut no_log_file = false;
             let mut diagnose = false;
+            let mut debug_packets = false;
+            let mut capture_dir: Option<PathBuf> = None;
+            let mut capture_max_mib = 1024u64;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--config" => {
@@ -438,6 +468,18 @@ mod clap_free_args {
                     }
                     "--no-log-file" => no_log_file = true,
                     "--diagnose" => diagnose = true,
+                    "--debug-packets" => debug_packets = true,
+                    "--capture-dir" => {
+                        capture_dir = Some(PathBuf::from(
+                            args.next().context("--capture-dir 需要路径参数")?,
+                        ));
+                    }
+                    "--capture-max-mib" => {
+                        let value = args.next().context("--capture-max-mib 需要数字参数")?;
+                        capture_max_mib =
+                            value.parse().context("--capture-max-mib 必须是正整数")?;
+                        anyhow::ensure!(capture_max_mib > 0, "--capture-max-mib 必须大于 0");
+                    }
                     "--version" | "-V" => {
                         println!(
                             "Miliastra-Wonderland-ChatBridge {}",
@@ -447,7 +489,7 @@ mod clap_free_args {
                     }
                     "--help" | "-h" => {
                         println!(
-                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--version]"
+                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
                         );
                         std::process::exit(0);
                     }
@@ -465,6 +507,9 @@ mod clap_free_args {
                 log_file,
                 no_log_file,
                 diagnose,
+                debug_packets,
+                capture_dir,
+                capture_max_mib,
             })
         }
     }

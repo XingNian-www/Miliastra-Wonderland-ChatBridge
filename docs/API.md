@@ -28,6 +28,8 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 | WebSocket | `/stream` | 实时事件订阅 |
 | GET | `/debug/metrics` | 完整运行指标（诊断） |
 | GET | `/debug/events` | 最近关键事件（诊断） |
+| GET | `/debug/packets` | 调试包模式快照（诊断/开关） |
+| POST | `/debug/packets` | 切换调试包模式 |
 
 ### GET /
 
@@ -121,6 +123,89 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
   { "offsetMs": 1200, "kind": "dll_connected", "detail": "" },
   { "offsetMs": 540000, "kind": "ws_lagged", "detail": "skipped=12" }
 ] }
+```
+
+### GET /debug/packets
+
+返回调试包模式、DLL 控制通道状态、全包计数与 raw 抓包状态。默认 `chat`（只转发聊天包）；`all` 时 DLL 额外转发全部包。
+
+```json
+{
+  "ok": true,
+  "mode": "all",
+  "dllControl": true,
+  "counts": {
+    "packets": 1200,
+    "bytes": 345600,
+    "cmds": {
+      "2246": { "count": 1180, "bytes": 330400 },
+      "4410": { "count": 20, "bytes": 15200 }
+    }
+  },
+  "capture": {
+    "enabled": true,
+    "dir": "captures",
+    "maxBytes": 1073741824,
+    "files": 1180,
+    "bytes": 330400,
+    "dropped": 0,
+    "stopped": false
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ok` | bool | 恒为 `true` |
+| `mode` | string | 当前模式：`chat` 或 `all` |
+| `dllControl` | bool | DLL 控制管道是否已连接；旧 DLL 恒为 `false` |
+| `counts.packets` | uint64 | 本次运行收到并统计的 debug 包数 |
+| `counts.bytes` | uint64 | 上述包的 payload 总字节数 |
+| `counts.cmds` | object | 按 cmd 统计：cmd（十进制字符串）→ `{count,bytes}` |
+| `capture` | object 或 null | 未配置 `--capture-dir`，或配置了但目录初始化失败（宿主日志有 warn）时为 `null`，否则见下 |
+
+`capture` 对象字段：`enabled`（是否已启用）、`dir`（落盘目录）、`maxBytes`（总字节上限）、`files`（已写文件数）、`bytes`（已写字节数）、`dropped`（因队列满或超限丢弃的抓包数）、`stopped`（是否已达上限停止抓包）。抓包只丢抓包，不影响转发。
+
+`counts` 统计的是 debug 管道收到的包；切到 `chat` 后 DLL 不再转发全包，计数停在切换前的值（重启后清零）。
+
+### POST /debug/packets
+
+切换调试包模式，请求体为 JSON：
+
+```json
+{ "mode": "all" }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `mode` | string | 必填，只接受 `chat` 或 `all`（区分大小写） |
+
+成功返回 `200`：
+
+```json
+{"ok":true,"mode":"all","applied":true,"dllControl":true}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ok` | bool | 恒为 `true` |
+| `mode` | string | 切换后的模式 |
+| `applied` | bool | `true` 表示模式已写入 DLL 控制管道并在 DLL 生效；`false` 表示只在宿主侧记录 |
+| `dllControl` | bool | 响应时 DLL 控制管道是否已连接 |
+
+`applied` / `dllControl` 语义：
+
+- `dllControl: true` + `applied: true`：控制管道已连接，DLL 已切换。
+- `dllControl: false` + `applied: false`：DLL 未连接或为旧 DLL（没有控制管道）。宿主仍会记录新模式（后续 `GET /debug/packets` 的 `mode` 已是新值），但 DLL 行为不会改变。
+- 宿主只接受一次控制/数据管道连接：DLL 断开后宿主记录的模式保留，但不会自动重连或重新下发；需要重启宿主与 DLL 才能恢复 debug 能力。
+
+模式是运行期状态，**不持久化**：进程重启后回到 `chat`，需要重新调用本接口。
+
+错误：令牌缺失或错误返回 `401`（`unauthorized`）；请求体不是合法 JSON、缺 `mode` 字段或类型不对返回 `400`（`bad_request`）；`mode` 不在 `chat` / `all` 内返回 `400`（`bad_request`，`message` 为 `mode must be chat or all`）。
+
+```sh
+curl -X POST -H "x-miliastra-token: <token>" -H "Content-Type: application/json" \
+     -d '{"mode":"all"}' http://127.0.0.1:18889/debug/packets
 ```
 
 ### GET /messages

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -18,6 +18,7 @@ use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::model::ServerEvent;
+use crate::packet_control::{PacketControl, PacketMode};
 use crate::state::ChatState;
 
 /// 服务运行期状态。
@@ -29,6 +30,8 @@ pub struct AppState {
     /// 监听端口与自身 UID：诊断接口要展示"这份实例是谁"。
     pub port: u16,
     pub self_uid: u32,
+    /// 调试全包模式开关与抓包状态，由 main 构造；HTTP 侧只做读写。
+    pub packets: Arc<PacketControl>,
 }
 
 /// 组装路由。
@@ -43,6 +46,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/stream", get(stream))
         .route("/debug/metrics", get(debug_metrics))
         .route("/debug/events", get(debug_events))
+        // GET 读快照、POST 切模式：必须挂在同一路由上，否则 POST 会被
+        // 全局 method_not_allowed 兜底吞掉（405 而不是业务响应）。
+        .route(
+            "/debug/packets",
+            get(debug_packets_get).post(debug_packets_set),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -320,6 +329,69 @@ async fn debug_events(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     Json(json!({ "events": crate::diag::events() })).into_response()
 }
 
+/// 调试包模式快照。
+///
+/// 默认 chat（只转发聊天包）；all 时新 DLL 会额外转发全部包。
+/// 快照已包含 ok/mode/dllControl/计数/抓包状态，这里原样透传。
+async fn debug_packets_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    Json(state.packets.snapshot_json()).into_response()
+}
+
+#[derive(Deserialize)]
+struct PacketModeBody {
+    mode: String,
+}
+
+/// 切换调试包模式。
+///
+/// 响应里的 applied 表示是否真的写到了 DLL 控制管道：DLL 未连接或
+/// 旧 DLL 不支持控制管道时为 false（此时只在宿主侧记录模式，
+/// dllControl 明确告诉调用方控制通道是否可用）。
+async fn debug_packets_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<PacketModeBody>, JsonRejection>,
+) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(err) => {
+            return ApiError(StatusCode::BAD_REQUEST, "bad_request", err.body_text())
+                .into_response();
+        }
+    };
+    let Some(mode) = PacketMode::parse(&body.mode) else {
+        return ApiError(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "mode must be chat or all".into(),
+        )
+        .into_response();
+    };
+    // 写 DLL 控制管道是同步 write+flush，可能等待管道对端；放到阻塞线程池，
+    // 避免占住 tokio worker（聊天链路虽然独立，但 HTTP 仍要响应）。
+    let packets = Arc::clone(&state.packets);
+    let applied = match tokio::task::spawn_blocking(move || packets.set_mode(mode)).await {
+        Ok(applied) => applied,
+        Err(error) => {
+            tracing::warn!("切换 debug 模式任务失败：{error}");
+            false
+        }
+    };
+    Json(json!({
+        "ok": true,
+        "mode": mode.as_str(),
+        "applied": applied,
+        "dllControl": state.packets.control_connected(),
+    }))
+    .into_response()
+}
+
 async fn handle_socket<S, E>(mut socket: S, state: Arc<AppState>)
 where
     S: Stream<Item = Result<Message, E>> + Sink<Message> + Unpin,
@@ -481,6 +553,8 @@ mod tests {
             connected: Arc::new(std::sync::atomic::AtomicBool::new(connected)),
             port: 18889,
             self_uid: 999,
+            // 单测里没有 DLL：默认 chat，控制管道未连接。
+            packets: PacketControl::new(PacketMode::Chat, None),
         })
     }
 
@@ -531,6 +605,139 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(value["events"].is_array());
+    }
+
+    /// 构造 /debug/packets 请求：GET 无 body，POST 可带 JSON。
+    fn packets_request(
+        method: &str,
+        body: Option<&str>,
+        token: Option<&str>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri("/debug/packets");
+        if let Some(token) = token {
+            builder = builder.header("x-miliastra-token", token);
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        builder
+            .body(match body {
+                Some(body) => axum::body::Body::from(body.to_string()),
+                None => axum::body::Body::empty(),
+            })
+            .unwrap()
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn debug_packets_require_token() {
+        for method in ["GET", "POST"] {
+            let body = (method == "POST").then_some(r#"{"mode":"chat"}"#);
+            let response = router(app_state(true))
+                .oneshot(packets_request(method, body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+            assert_eq!(response.headers()["content-type"], "application/json");
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_packets_get_reports_chat_mode_without_dll() {
+        let response = router(app_state(true))
+            .oneshot(packets_request("GET", None, Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["mode"], "chat");
+        assert_eq!(value["dllControl"], false);
+    }
+
+    #[tokio::test]
+    async fn debug_packets_post_switches_mode_and_reports_applied() {
+        let state = app_state(true);
+        let app = router(state.clone());
+        // 同路由注册 POST，不能被全局 method_not_allowed 兜底抢成 405。
+        let response = app
+            .clone()
+            .oneshot(packets_request(
+                "POST",
+                Some(r#"{"mode":"all"}"#),
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(
+            value,
+            json!({ "ok": true, "mode": "all", "applied": false, "dllControl": false })
+        );
+        // DLL 未连接时只在宿主侧记录模式：GET 立即反映 all，且不报错。
+        let response = app
+            .clone()
+            .oneshot(packets_request("GET", None, Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["mode"], "all");
+        // 切回 chat：模式是运行期状态，不持久化。
+        let response = app
+            .oneshot(packets_request(
+                "POST",
+                Some(r#"{"mode":"chat"}"#),
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["mode"], "chat");
+        assert_eq!(value["applied"], false);
+    }
+
+    #[tokio::test]
+    async fn debug_packets_post_rejects_bad_mode_and_bad_json() {
+        let app = router(app_state(true));
+        // 合法 JSON 但模式不认识：固定错误消息，方便调用方排查。
+        for body in [
+            r#"{"mode":"everything"}"#,
+            r#"{"mode":""}"#,
+            r#"{"mode":"CHAT"}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(packets_request("POST", Some(body), Some("secret")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "bad_request");
+            assert_eq!(value["error"]["message"], "mode must be chat or all");
+        }
+        // 解析失败/缺字段/类型不对：也是 400 ApiError，不泄露内部细节。
+        for body in ["not json", r#"{}"#, r#"{"mode":42}"#] {
+            let response = app
+                .clone()
+                .oneshot(packets_request("POST", Some(body), Some("secret")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "bad_request");
+            assert!(value["error"]["message"].is_string());
+        }
     }
 
     fn private_message() -> crate::extract::RawChat {

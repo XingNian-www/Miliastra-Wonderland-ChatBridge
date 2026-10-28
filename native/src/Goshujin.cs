@@ -150,6 +150,19 @@ internal static class PacketOutbox {
 ///   0xFD LoadMethodTable: 宿主回 10 个 u32 RVA
 ///   0xFE ResumeMainThread: 恢复游戏主线程（无回执）
 ///
+/// 主管道之外还有两条**可选增强**管道（宿主是 server、DLL 是 client）：
+///   MiliastraWonderlandChatBridgeCtl  : 控制管道，宿主→DLL。每条消息 1 字节模式，
+///                                       0=chat（默认，只转发 RequiredPackets），
+///                                       1=all（转发所有合法包）。宿主在 DLL 连上后立即
+///                                       下发当前模式，之后每次 API 切换再写 1 字节。
+///   MiliastraWonderlandChatBridgeDebug: debug 数据管道，DLL→宿主，单向、无 ACK。
+///                                       帧与 0x04 相同：0x04 + cmdId(u16) + 长度(u32) + 数据，
+///                                       只在 all 模式下写，与聊天管道完全隔离。
+///
+/// 向后兼容：旧宿主不会创建这两条管道。DLL 在 Awake 里用后台线程连接（见
+/// <see cref="ModeControl"/> / <see cref="DebugOutbox"/>），5s 超时后只停用对应
+/// 增强功能（控制通道回落 chat、debug 通道不再发送），聊天管道与注入流程不受影响。
+///
 /// 与上游相比删掉了玩家属性推送，并**禁用了自动退出**——
 /// 上游在订阅清空时会 Environment.Exit(0) 直接结束游戏进程，
 /// 对常驻嗅探来说太危险。

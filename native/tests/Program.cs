@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Channels;
 using MiliastraWonderlandChatBridge;
 
@@ -19,13 +20,18 @@ internal static class Program {
     private static void Main(string[] args) {
         if (args.Length == 0) {
             ParserChecks();
-            foreach (var scenario in new[] { "queue", "ack", "disconnect", "timeout" }) RunIsolated(scenario);
+            ModeChecks();
+            DebugChecks();
+            foreach (var scenario in new[] { "queue", "ack", "disconnect", "timeout", "debugcapacity", "debugbytes" })
+                RunIsolated(scenario);
         } else {
             switch (args[0]) {
                 case "queue": QueueChecks(); break;
                 case "ack": SenderChecks(false); break;
                 case "disconnect": SenderChecks(true); break;
                 case "timeout": TimeoutChecks(); break;
+                case "debugcapacity": DebugCapacityChecks(); break;
+                case "debugbytes": DebugByteCapChecks(); break;
                 default: throw new ArgumentException("Unknown regression scenario");
             }
         }
@@ -89,6 +95,71 @@ internal static class Program {
             BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(6), 3);
             Check(!parse(p, packet.Length, out _, out _), "truncated packet rejected");
         }
+    }
+
+    private static void ModeChecks() {
+        Check(!ModeControl.AllPackets, "mode control defaults to chat");
+        const ushort unknown = 0x7777;
+        Check(!Application.ShouldForward(unknown), "chat mode does not forward unknown commands");
+        ModeControl.SetAllPacketsForTest(true);
+        try {
+            Check(ModeControl.AllPackets, "test switch turns mode control to all");
+            Check(Application.ShouldForward(unknown), "all mode forwards unknown commands");
+        } finally {
+            ModeControl.SetAllPacketsForTest(false);
+        }
+        const ushort chat = 0x7778;
+        Application.RequiredPackets.Add(chat);
+        try {
+            Check(Application.ShouldForward(chat), "required chat command forwards in chat mode");
+            ModeControl.SetAllPacketsForTest(true);
+            Check(Application.ShouldForward(chat), "required chat command still forwards in all mode");
+        } finally {
+            ModeControl.SetAllPacketsForTest(false);
+            Application.RequiredPackets.Remove(chat);
+        }
+        Check(!ModeControl.AllPackets, "mode control returns to chat after the test switch");
+    }
+
+    private static void DebugChecks() {
+        var capacity = (int) typeof(DebugOutbox).GetField("Capacity", Flags)!.GetRawConstantValue()!;
+        Check(capacity == 1024, "debug queue is bounded at 1024 packets");
+        var maxBytes = (long) typeof(DebugOutbox).GetField("MaxQueuedBytes", Flags)!.GetRawConstantValue()!;
+        Check(maxBytes == 32L * 1024 * 1024, "debug queue caps queued bytes at 32 MiB");
+        // 帧编码：0x04 + cmdId(u16 LE) + 长度(u32 LE) + 数据，与聊天管道 0x04 完全一致。
+        using var sink = new MemoryStream();
+        using (var writer = new BinaryWriter(sink, Encoding.UTF8, leaveOpen: true)) {
+            DebugOutbox.WriteFrame(writer, 0x1234, [10, 20]);
+        }
+        Check(sink.ToArray().SequenceEqual(new byte[] { 4, 0x34, 0x12, 2, 0, 0, 0, 10, 20 }),
+            "debug frame encodes 0x04 + cmd + length + payload");
+    }
+
+    // 每个场景单独进程：debug 队列与聊天队列都是单次使用的静态对象。
+    private static void DebugCapacityChecks() {
+        var capacity = (int) typeof(DebugOutbox).GetField("Capacity", Flags)!.GetRawConstantValue()!;
+        for (var i = 0; i < capacity; i++) DebugOutbox.Enqueue((ushort) i, [(byte) i]);
+        Check(DebugOutbox.Dropped == 0, "debug queue holds exactly capacity packets");
+        DebugOutbox.Enqueue(0, [1]);
+        Check(DebugOutbox.Dropped == 1, "debug queue drops the capacity+1 packet");
+        Check(!PacketOutbox.Disabled, "debug queue overflow leaves the chat outbox enabled");
+
+        DebugOutbox.Disable("regression");
+        Check(DebugOutbox.Disabled, "debug disable latches");
+        DebugOutbox.Enqueue(0, [2]);
+        Check(DebugOutbox.Dropped == 1, "disabled debug outbox ignores new packets");
+        Check(!PacketOutbox.Disabled, "debug disable leaves the chat outbox enabled");
+    }
+
+    private static void DebugByteCapChecks() {
+        var maxBytes = (long) typeof(DebugOutbox).GetField("MaxQueuedBytes", Flags)!.GetRawConstantValue()!;
+        // 32 份 1 MiB 正好填满 32 MiB 预算，但远未触及 1024 条容量上限。
+        var chunk = new byte[maxBytes / 32];
+        for (var i = 0; i < 32; i++) DebugOutbox.Enqueue((ushort) i, chunk);
+        Check(DebugOutbox.Dropped == 0, "debug byte budget accepts 32 MiB");
+        DebugOutbox.Enqueue(0, chunk);
+        Check(DebugOutbox.Dropped == 1, "debug byte budget rejects the packet that would exceed it");
+        Check(!PacketOutbox.Disabled, "debug byte budget overflow leaves the chat outbox enabled");
     }
 
     private static Channel<PendingPacket> Queue =>

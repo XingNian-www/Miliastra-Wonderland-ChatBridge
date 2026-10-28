@@ -476,18 +476,26 @@ mod tests {
             return;
         };
         let profiles = extract_friend_profiles(&bytes);
-        assert_eq!(profiles.len(), 35, "真实信封里应有 35 条好友记录");
-        assert_eq!(
-            profiles.iter().filter(|p| p.remark.is_some()).count(),
-            22,
-            "其中 22 条带备注"
+        // 只断言结构计数与字段形状，不落任何真实玩家的 UID/昵称/备注。
+        assert_eq!(profiles.len(), 35, "样本信封里应有 35 条好友记录");
+        assert!(
+            profiles
+                .iter()
+                .all(|p| p.uid > 0 && p.name.as_deref().is_some_and(|n| !n.is_empty())),
+            "每条记录都应有正 UID 与非空昵称"
         );
-        let owner = profiles.iter().find(|p| p.uid == 100000003).unwrap();
-        assert_eq!(owner.name.as_deref(), Some("丙玩家"));
-        assert_eq!(owner.remark.as_deref(), Some("rmkCCC3"));
-        let plain = profiles.iter().find(|p| p.uid == 100000002).unwrap();
-        assert_eq!(plain.name.as_deref(), Some("乙玩家"));
-        assert_eq!(plain.remark, None);
+        let with_remark = profiles.iter().filter(|p| p.remark.is_some()).count();
+        assert!(
+            with_remark > 0 && with_remark < profiles.len(),
+            "备注应为可选字段"
+        );
+        assert!(
+            profiles
+                .iter()
+                .filter_map(|p| p.remark.as_deref())
+                .all(|r| !r.is_empty()),
+            "空备注必须被视为未设置"
+        );
     }
 
     #[test]

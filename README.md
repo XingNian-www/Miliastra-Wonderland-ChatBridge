@@ -51,6 +51,40 @@ miliastra-wonderland-chatbridge --diagnose --port 18889 --token <令牌> --self-
 3. 延迟发生时立刻 `GET /messages?since=<最后一条 id>`：立刻有 → 延迟在 WS/观察台；没有 → 还在管道或注入。
 4. `/debug/events` 里出现 `ws_lagged` 表示订阅端落后被断开，需要看页面是否卡顿。
 
+### 调试全包模式（API 开关）
+
+默认 `chat`：DLL 只转发聊天包，聊天处理与未启用时完全一致。排查未知包时可在运行时切到 `all`：DLL 通过**独立的 debug 管道**额外转发所有能抓到的包，聊天管道的队列、ACK 与线程都不受影响。模式只存在进程内存里，**不持久化**，重启后回到 `chat`。
+
+```sh
+# 查看当前模式与全包计数（默认 chat）
+curl -H "x-miliastra-token: <令牌>" http://127.0.0.1:18889/debug/packets
+
+# 切到全包模式
+curl -X POST -H "x-miliastra-token: <令牌>" -H "Content-Type: application/json" \
+     -d '{"mode":"all"}' http://127.0.0.1:18889/debug/packets
+
+# 切回聊天模式
+curl -X POST -H "x-miliastra-token: <令牌>" -H "Content-Type: application/json" \
+     -d '{"mode":"chat"}' http://127.0.0.1:18889/debug/packets
+```
+
+切换响应里的 `applied` 表示模式是否真的下发给 DLL：`applied: true` 说明控制管道已连接（`dllControl: true`）且 DLL 已切换；`applied: false` 表示 DLL 未连接或仍是**旧 DLL**（没有控制管道），此时只在宿主侧记录模式，`dllControl` 如实反映控制通道是否可用。要真正拿到全包，需要配套的新 DLL。
+
+raw 抓包（可选，**只有全包模式才有数据**）：
+
+```sh
+miliastra-wonderland-chatbridge --port 18889 --token <令牌> --self-uid <UID> \
+  --debug-packets --capture-dir captures --capture-max-mib 1024
+```
+
+- `--debug-packets`：启动即为 `all`；不写则从 `chat` 开始，之后用 API 切换。
+- `--capture-dir <目录>`：raw 包落盘目录；不指定就不落盘。
+- `--capture-max-mib <n>`：落盘 payload 总字节上限，默认 `1024`（1 GiB），不含 index/文件系统开销；超过后停止抓包，只丢抓包，不影响聊天与转发。
+
+落盘文件名形如 `p_00042_02246_137.bin`（序号、cmd、payload 长度），`index.csv` 逐行 `seq,cmd,len,unixMillis`；文件内容是与游戏嗅探一致的原始 protobuf payload，不含管道帧头。每次启动只重建 `index.csv`，不会清理目录里上一次留下的 `p_*.bin`；复用目录前请先清空，避免新旧文件混在一起。
+
+注意：全包模式会把**所有**能抓到的包（包含非聊天、可能含账号/环境信息）写入磁盘与 debug 管道，只建议在内网、可信环境短期开启；`captures/` 目录不要外传，用完及时删除。debug 走独立管道，即使它断开或写盘失败，聊天通道也照常工作；但全包模式会让游戏的网络解包线程对每个包多一次解压/复制，属于重诊断模式，长期开启有性能代价，用完请切回 `chat`。
+
 ## 许可与致谢
 
 本项目采用 **GNU GPL v3.0（GPL-3.0-only）**，完整条款见 [LICENSE](LICENSE)。第三方组件保留各自的版权与许可。

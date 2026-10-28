@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, Result};
 
 use crate::extract;
+use crate::packet_control::{CONTROL_PIPE_NAME, DEBUG_PIPE_NAME, PacketControl};
 use crate::state::ChatState;
 
 /// 与 DLL 约定的管道名。
@@ -32,8 +33,8 @@ pub const PIPE_NAME: &str = "MiliastraWonderlandChatBridgePipe";
 ///
 /// CreateNamedPipeW 要求 `\\.\pipe\<name>` 前缀；只给短名会得到
 /// ERROR_INVALID_NAME (123)。DLL 侧用 NamedPipeClientStream 只需短名。
-fn pipe_path() -> Vec<u16> {
-    format!(r"\\.\pipe\{PIPE_NAME}")
+fn pipe_path_named(name: &str) -> Vec<u16> {
+    format!(r"\\.\pipe\{name}")
         .encode_utf16()
         .chain(Some(0))
         .collect()
@@ -45,6 +46,7 @@ fn pipe_path() -> Vec<u16> {
 pub async fn run(
     chat: Arc<ChatState>,
     connected: Arc<AtomicBool>,
+    packets: Arc<PacketControl>,
     auto_launch: bool,
     spawn_only: bool,
     lib_only: bool,
@@ -56,6 +58,7 @@ pub async fn run(
         let result = serve_once(
             &chat,
             &connected,
+            &packets,
             auto_launch,
             spawn_only,
             lib_only,
@@ -109,6 +112,7 @@ fn wait_for_pipe_data(stream: &std::fs::File) -> Result<bool> {
 fn serve_once(
     chat: &ChatState,
     connected: &AtomicBool,
+    packets: &Arc<PacketControl>,
     auto_launch: bool,
     spawn_only: bool,
     lib_only: bool,
@@ -147,6 +151,26 @@ fn serve_once(
     let dll = locate_dll()?;
     let rva = resolve_rva(&exe)?;
     let pipe = create_pipe()?;
+    // debug 数据管道与模式控制管道必须也在注入前创建：DLL 初始化时会主动连接。
+    // 这两条是可选增强：创建失败只停用 debug 能力，不能因此中止聊天注入。
+    match create_named_pipe_server(
+        DEBUG_PIPE_NAME,
+        windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND,
+    ) {
+        Ok(debug_pipe) => start_debug_pipe(debug_pipe, Arc::clone(packets)),
+        Err(error) => {
+            tracing::warn!("debug 数据管道创建失败，全包模式不可用（聊天不受影响）：{error:#}")
+        }
+    }
+    match create_named_pipe_server(
+        CONTROL_PIPE_NAME,
+        windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_OUTBOUND,
+    ) {
+        Ok(control_pipe) => start_control_pipe(control_pipe, Arc::clone(packets)),
+        Err(error) => {
+            tracing::warn!("控制管道创建失败，debug 开关不可用（聊天不受影响）：{error:#}")
+        }
+    }
     check_cancelled(cancelled)?;
     tracing::info!("启动并注入 {} -> {}", exe.display(), dll.display());
     let proc = spawn_suspended(&exe)?;
@@ -324,11 +348,20 @@ impl Drop for PipeHandle {
 }
 
 fn create_pipe() -> Result<PipeHandle> {
-    // 上一次会话被强杀后，管道名会被内核短时间占用（ERROR_PIPE_BUSY）。
-    // 等待重试比失败退出好：用户重启服务时不需要手动等待。
+    create_named_pipe_server(
+        PIPE_NAME,
+        windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+    )
+}
+
+/// 创建一条命名管道 server；同名实例被占用时重试。
+///
+/// 上一次会话被强杀后，管道名会被内核短时间占用（ERROR_PIPE_BUSY）。
+/// 等待重试比失败退出好：用户重启服务时不需要手动等待。
+fn create_named_pipe_server(name: &str, access: u32) -> Result<PipeHandle> {
     let mut last_error = None;
     for attempt in 0..10 {
-        match create_pipe_once() {
+        match create_named_pipe(&pipe_path_named(name), access) {
             Ok(pipe) => return Ok(pipe),
             Err(error) => {
                 let busy = error
@@ -340,13 +373,13 @@ fn create_pipe() -> Result<PipeHandle> {
                 }
                 last_error = Some(error);
                 if attempt < 9 {
-                    tracing::debug!("管道被占用，200ms 后重试 ({}/10)", attempt + 1);
+                    tracing::debug!("管道 {name} 被占用，200ms 后重试 ({}/10)", attempt + 1);
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("创建管道失败")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("创建管道 {name} 失败")))
 }
 
 /// 尝试打开一条已有服务实例的管道。
@@ -380,14 +413,8 @@ fn probe_existing_server() -> bool {
     true
 }
 
-fn create_pipe_once() -> Result<PipeHandle> {
-    create_named_pipe(&pipe_path())
-}
-
-fn create_named_pipe(name: &[u16]) -> Result<PipeHandle> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
-    };
+fn create_named_pipe(name: &[u16], access: u32) -> Result<PipeHandle> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_FIRST_PIPE_INSTANCE;
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
@@ -395,7 +422,7 @@ fn create_named_pipe(name: &[u16]) -> Result<PipeHandle> {
     let handle = unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            access | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1,
             65536,
@@ -495,6 +522,105 @@ fn connect_pipe(pipe: &PipeHandle, proc: &SuspendedProcess, cancelled: &AtomicBo
         _ => Err(error).context("等待管道连接失败"),
     }
 }
+/// 等待 DLL 连上控制管道；成功后把只写句柄交给 PacketControl。
+fn start_control_pipe(pipe: PipeHandle, packets: Arc<PacketControl>) {
+    // PipeHandle 是裸句柄，不实现 Send；把所有权编码成整数交给后台线程。
+    let raw = pipe.0 as usize;
+    std::mem::forget(pipe);
+    let spawned = std::thread::Builder::new()
+        .name("mwc-control-pipe".to_owned())
+        .spawn(move || {
+            let Some(file) = take_connected_pipe(raw, "control") else {
+                return;
+            };
+            packets.attach_control(Box::new(file));
+        });
+    if let Err(error) = spawned {
+        tracing::warn!("启动控制管道线程失败：{error}");
+    }
+}
+
+/// 等待 DLL 连上 debug 数据管道，然后持续解析包并交给 PacketControl。
+///
+/// debug 管道是单向的：DLL 写、宿主读，没有 ACK；协议帧复用聊天管道的
+/// 0x04 PushPacketData 编码。解析/统计/落盘都在这个独立线程里，不碰聊天状态。
+fn start_debug_pipe(pipe: PipeHandle, packets: Arc<PacketControl>) {
+    let raw = pipe.0 as usize;
+    std::mem::forget(pipe);
+    let spawned = std::thread::Builder::new()
+        .name("mwc-debug-pipe".to_owned())
+        .spawn(move || {
+            use std::io::Read;
+            let Some(mut file) = take_connected_pipe(raw, "debug") else {
+                return;
+            };
+            tracing::info!("debug 数据管道已连接");
+            let mut buffered: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 65536];
+            loop {
+                match file.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+                    Err(error) => {
+                        tracing::warn!("读 debug 管道失败：{error}");
+                        break;
+                    }
+                }
+                while let Some(&kind) = buffered.first() {
+                    match crate::pipe::parse(kind, &buffered[1..]) {
+                        Ok(Some((frame, used))) => {
+                            buffered.drain(..1 + used);
+                            if let crate::pipe::Frame::Packet { cmd, payload } = frame {
+                                packets.observe_debug_packet(cmd, &payload);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::warn!("debug 管道协议错误，停止抓包：{error:#}");
+                            return;
+                        }
+                    }
+                }
+                if buffered.len() > crate::pipe::MAX_PAYLOAD + 6 {
+                    tracing::warn!("debug 管道缓冲异常，停止抓包");
+                    return;
+                }
+            }
+            tracing::info!("debug 数据管道已关闭");
+        });
+    if let Err(error) = spawned {
+        tracing::warn!("启动 debug 管道线程失败：{error}");
+    }
+}
+
+/// 阻塞等待一条已创建的命名管道被客户端连接，成功后转成 File。
+fn take_connected_pipe(raw: usize, label: &str) -> Option<std::fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    let handle = raw as *mut std::ffi::c_void;
+    if let Err(error) = accept_pipe(handle) {
+        tracing::warn!("等待 {label} 管道连接失败：{error:#}");
+        // SAFETY: 句柄来自 CreateNamedPipeW，尚未转交。
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+        return None;
+    }
+    // SAFETY: 句柄已连接，所有权转交 File，之后由 File 关闭。
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+fn accept_pipe(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+    // SAFETY: handle 是 CreateNamedPipeW 返回的合法实例句柄。
+    if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // ERROR_PIPE_CONNECTED：客户端已经连上，视为成功。
+        Some(535) => Ok(()),
+        _ => Err(error).context("等待 debug/control 管道连接失败"),
+    }
+}
+
 /// 解析 metadata，按游戏 exe 的 CRC32 取 RVA 表。
 fn resolve_rva(exe: &std::path::Path) -> Result<crate::metadata::MethodRva> {
     use std::io::Read;

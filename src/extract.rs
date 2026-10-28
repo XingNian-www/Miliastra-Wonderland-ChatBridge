@@ -15,14 +15,8 @@ pub const CMD_ENVELOPE: u16 = 2246;
 /// 私聊实时也可能以独立 cmd 486 下发（不经信封）。
 pub const CMD_PRIVATE_DIRECT: u16 = 486;
 
-/// 好友列表（进游戏时全量下发一次，之后按需懒加载）。
-///
-/// 备注不在聊天包与资料包里，只在好友记录的 #17。不订阅这个 cmd
-/// 就永远拿不到备注——这也是之前“备注查不到”的根本原因。
-pub const CMD_FRIEND_LIST: u16 = 4410;
-
 /// 需要订阅的所有 cmd。
-pub const WANTED_CMDS: &[u16] = &[CMD_ENVELOPE, CMD_PRIVATE_DIRECT, CMD_FRIEND_LIST];
+pub const WANTED_CMDS: &[u16] = &[CMD_ENVELOPE, CMD_PRIVATE_DIRECT];
 
 /// 内层事件类型。
 pub const INNER_HALL_CHAT: u64 = 20415;
@@ -31,6 +25,9 @@ pub const INNER_HALL_LIST: u64 = 25313;
 pub const INNER_PRIVATE_HISTORY: u64 = 28347;
 pub const INNER_HALL_MEMBERS: u64 = 2076;
 pub const INNER_HALL_POPULATION: u64 = 7154;
+/// 好友列表（含备注）。**不是独立 cmd**，而是 2246 信封里的内层事件类型；
+/// 进游戏时随信封一次性下发，之后按需懒加载。
+pub const INNER_FRIEND_LIST: u64 = 4410;
 
 // 字段号
 const F_EVENTS: u32 = 8;
@@ -205,9 +202,15 @@ pub fn extract_names(payload: &[u8]) -> Vec<(u32, String)> {
             continue;
         };
         for member in payload.repeated_messages(F_MSG_BODY_HALL) {
-            let Some(uid) = member.varint(1) else { continue };
-            let Some(name) = member.string(2) else { continue };
-            let Ok(uid) = u32::try_from(uid) else { continue };
+            let Some(uid) = member.varint(1) else {
+                continue;
+            };
+            let Some(name) = member.string(2) else {
+                continue;
+            };
+            let Ok(uid) = u32::try_from(uid) else {
+                continue;
+            };
             if !name.is_empty() {
                 out.push((uid, name.to_owned()));
             }
@@ -226,18 +229,29 @@ pub struct FriendProfile {
     pub remark: Option<String>,
 }
 
-/// 从 4410 好友列表提取档案。
+/// 从 2246 信封里提取好友档案（内层事件 `#13 = 4410`）。
 ///
-/// 结构与聊天包不同：没有 #8 信封，顶层直接是重复的 #15 记录：
+/// 结构：`#8 { #13 = 4410, #6 = { #15 记录... } }`，每条 `#15` 是一个好友：
 ///   #15 { #1 uid, #2 昵称, #6 签名, #17 备注, ... }
 ///
+/// 注意：好友列表**不是独立 cmd**，只出现在信封内部，所以只订阅 2246 即可。
 /// #17 是可选字段：没设置备注的好友不会带它（实测 35 条里 13 条没有）。
 pub fn extract_friend_profiles(payload: &[u8]) -> Vec<FriendProfile> {
     let Ok(root) = proto::parse(payload) else {
         return Vec::new();
     };
+    let mut records = Vec::new();
+    for event in root.repeated_messages(F_EVENTS) {
+        if event.varint(F_INNER_TYPE) != Some(INNER_FRIEND_LIST) {
+            continue;
+        }
+        let Some(body) = event.message(F_PAYLOAD) else {
+            continue;
+        };
+        records.extend(body.repeated_messages(F_FRIEND_RECORD));
+    }
     let mut out = Vec::new();
-    for record in root.repeated_messages(F_FRIEND_RECORD) {
+    for record in records {
         let Some(uid) = record.varint(F_FRIEND_UID) else {
             continue;
         };
@@ -357,8 +371,19 @@ mod tests {
         concat(parts)
     }
 
+    /// 构造 2246 信封：内层事件 #13=4410，载荷 #6 里挂 #15 记录。
     fn friend_list(records: Vec<Vec<u8>>) -> Vec<u8> {
-        concat(records.into_iter().map(|r| field_bytes(F_FRIEND_RECORD, &r)).collect())
+        let body = concat(
+            records
+                .into_iter()
+                .map(|r| field_bytes(F_FRIEND_RECORD, &r))
+                .collect(),
+        );
+        let event = concat(vec![
+            field_bytes(6, &body),
+            field_varint(13, INNER_FRIEND_LIST),
+        ]);
+        field_bytes(8, &event)
     }
 
     #[test]
@@ -403,8 +428,38 @@ mod tests {
     fn friend_list_skips_records_without_uid() {
         // 没有 #1 的记录无法归属，必须丢弃而不是猜。
         let record = concat(vec![field_bytes(F_FRIEND_NAME, "无主".as_bytes())]);
-        let payload = field_bytes(F_FRIEND_RECORD, &record);
-        assert!(extract_friend_profiles(&payload).is_empty());
+        assert!(extract_friend_profiles(&friend_list(vec![record])).is_empty());
+    }
+
+    #[test]
+    fn friend_list_ignores_other_inner_events() {
+        // 同一信封里还有别的内层类型，不能把它们的 #15 误当好友。
+        let friends = friend_list(vec![friend_record(1, "甲", Some("备注甲"))]);
+        let other_body = concat(vec![field_bytes(
+            F_FRIEND_RECORD,
+            &friend_record(2, "乙", Some("备注乙")),
+        )]);
+        let other = concat(vec![field_bytes(6, &other_body), field_varint(13, 7739)]);
+        // 把好友事件与无关事件拼在同一个信封里。
+        let friend_event = field_bytes(
+            8,
+            &concat(vec![
+                field_bytes(
+                    6,
+                    &concat(vec![field_bytes(
+                        F_FRIEND_RECORD,
+                        &friend_record(1, "甲", Some("备注甲")),
+                    )]),
+                ),
+                field_varint(13, INNER_FRIEND_LIST),
+            ]),
+        );
+        let mut payload = friend_event;
+        payload.extend(field_bytes(8, &other));
+        let profiles = extract_friend_profiles(&payload);
+        assert_eq!(profiles.len(), 1, "只认 #13=4410 的事件");
+        assert_eq!(profiles[0].uid, 1);
+        let _ = friends;
     }
 
     #[test]
@@ -412,9 +467,34 @@ mod tests {
         assert!(extract_friend_profiles(&[0xff, 0xff, 0xff]).is_empty());
     }
 
+    /// 真实抓包回归：2246 信封里的 #13=4410 事件。
+    ///
+    /// 样本不入库（避免把玩家昵称/备注提交进仓库），只在文件存在时校验。
     #[test]
-    fn wanted_cmds_include_friend_list() {
-        assert!(WANTED_CMDS.contains(&CMD_FRIEND_LIST));
+    fn extracts_remarks_from_real_envelope_when_sample_available() {
+        let Ok(bytes) = std::fs::read("/tmp/p23.bin") else {
+            return;
+        };
+        let profiles = extract_friend_profiles(&bytes);
+        assert_eq!(profiles.len(), 35, "真实信封里应有 35 条好友记录");
+        assert_eq!(
+            profiles.iter().filter(|p| p.remark.is_some()).count(),
+            22,
+            "其中 22 条带备注"
+        );
+        let owner = profiles.iter().find(|p| p.uid == 100000003).unwrap();
+        assert_eq!(owner.name.as_deref(), Some("丙玩家"));
+        assert_eq!(owner.remark.as_deref(), Some("rmkCCC3"));
+        let plain = profiles.iter().find(|p| p.uid == 100000002).unwrap();
+        assert_eq!(plain.name.as_deref(), Some("乙玩家"));
+        assert_eq!(plain.remark, None);
+    }
+
+    #[test]
+    fn friend_list_needs_no_extra_subscription() {
+        // 好友列表在 2246 信封内部，所以订阅表保持原样即可。
+        assert!(WANTED_CMDS.contains(&CMD_ENVELOPE));
+        assert_eq!(WANTED_CMDS.len(), 2);
     }
 
     /// 构造一条大厅聊天的完整信封。
@@ -431,10 +511,7 @@ mod tests {
             field_varint(2, hall_id),
         ]);
         let payload = concat(vec![field_bytes(4, &body), field_bytes(15, &hall)]);
-        let event = concat(vec![
-            field_bytes(6, &payload),
-            field_varint(13, 20415),
-        ]);
+        let event = concat(vec![field_bytes(6, &payload), field_varint(13, 20415)]);
         field_bytes(8, &event)
     }
 

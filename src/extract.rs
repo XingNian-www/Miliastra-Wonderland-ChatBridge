@@ -15,8 +15,14 @@ pub const CMD_ENVELOPE: u16 = 2246;
 /// 私聊实时也可能以独立 cmd 486 下发（不经信封）。
 pub const CMD_PRIVATE_DIRECT: u16 = 486;
 
+/// 好友列表（进游戏时全量下发一次，之后按需懒加载）。
+///
+/// 备注不在聊天包与资料包里，只在好友记录的 #17。不订阅这个 cmd
+/// 就永远拿不到备注——这也是之前“备注查不到”的根本原因。
+pub const CMD_FRIEND_LIST: u16 = 4410;
+
 /// 需要订阅的所有 cmd。
-pub const WANTED_CMDS: &[u16] = &[CMD_ENVELOPE, CMD_PRIVATE_DIRECT];
+pub const WANTED_CMDS: &[u16] = &[CMD_ENVELOPE, CMD_PRIVATE_DIRECT, CMD_FRIEND_LIST];
 
 /// 内层事件类型。
 pub const INNER_HALL_CHAT: u64 = 20415;
@@ -48,6 +54,13 @@ const F_EMOJI: u32 = 1448;
 // 大厅上下文
 const F_HALL_TYPE: u32 = 1;
 const F_HALL_ID: u32 = 2;
+
+// 好友记录（4410 顶层 #15，每条一个好友）
+const F_FRIEND_RECORD: u32 = 15;
+const F_FRIEND_UID: u32 = 1;
+const F_FRIEND_NAME: u32 = 2;
+/// 备注：玩家给好友起的自定义名字。空/缺失 = 未设置。
+const F_FRIEND_REMARK: u32 = 17;
 
 /// 一条从信封里提取出的原始消息（尚未判定频道）。
 #[derive(Clone, Debug, PartialEq)]
@@ -203,6 +216,48 @@ pub fn extract_names(payload: &[u8]) -> Vec<(u32, String)> {
     out
 }
 
+/// 一条好友档案。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FriendProfile {
+    pub uid: u32,
+    /// 游戏内昵称（#2），可随时改名。
+    pub name: Option<String>,
+    /// 玩家给该好友设置的备注（#17）；None = 这条记录没带备注。
+    pub remark: Option<String>,
+}
+
+/// 从 4410 好友列表提取档案。
+///
+/// 结构与聊天包不同：没有 #8 信封，顶层直接是重复的 #15 记录：
+///   #15 { #1 uid, #2 昵称, #6 签名, #17 备注, ... }
+///
+/// #17 是可选字段：没设置备注的好友不会带它（实测 35 条里 13 条没有）。
+pub fn extract_friend_profiles(payload: &[u8]) -> Vec<FriendProfile> {
+    let Ok(root) = proto::parse(payload) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for record in root.repeated_messages(F_FRIEND_RECORD) {
+        let Some(uid) = record.varint(F_FRIEND_UID) else {
+            continue;
+        };
+        let Ok(uid) = u32::try_from(uid) else {
+            continue;
+        };
+        // 空串按“没有”处理，避免把空备注写进映射。
+        let name = record
+            .string(F_FRIEND_NAME)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let remark = record
+            .string(F_FRIEND_REMARK)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        out.push(FriendProfile { uid, name, remark });
+    }
+    out
+}
+
 /// 读取载荷里的消息体。
 ///
 /// 大厅与私聊的消息体字段号不同：大厅在 `#6.#4`，私聊在 `#6.#8`。
@@ -287,6 +342,79 @@ mod tests {
 
     fn concat(parts: Vec<Vec<u8>>) -> Vec<u8> {
         parts.concat()
+    }
+
+    /// 构造一条好友记录（4410 的 #15）。
+    fn friend_record(uid: u32, name: &str, remark: Option<&str>) -> Vec<u8> {
+        let mut parts = vec![
+            field_varint(F_FRIEND_UID, uid.into()),
+            field_bytes(F_FRIEND_NAME, name.as_bytes()),
+            field_bytes(6, "签名".as_bytes()),
+        ];
+        if let Some(remark) = remark {
+            parts.push(field_bytes(F_FRIEND_REMARK, remark.as_bytes()));
+        }
+        concat(parts)
+    }
+
+    fn friend_list(records: Vec<Vec<u8>>) -> Vec<u8> {
+        concat(records.into_iter().map(|r| field_bytes(F_FRIEND_RECORD, &r)).collect())
+    }
+
+    #[test]
+    fn friend_list_yields_uid_name_and_optional_remark() {
+        let payload = friend_list(vec![
+            friend_record(100000001, "甲玩家", Some("rmkAAA1")),
+            friend_record(100000002, "乙玩家", None),
+            friend_record(100000003, "丙玩家", Some("rmkCCC3")),
+        ]);
+        let profiles = extract_friend_profiles(&payload);
+        assert_eq!(
+            profiles,
+            vec![
+                FriendProfile {
+                    uid: 100000001,
+                    name: Some("甲玩家".into()),
+                    remark: Some("rmkAAA1".into()),
+                },
+                FriendProfile {
+                    uid: 100000002,
+                    name: Some("乙玩家".into()),
+                    remark: None,
+                },
+                FriendProfile {
+                    uid: 100000003,
+                    name: Some("丙玩家".into()),
+                    remark: Some("rmkCCC3".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn friend_list_treats_empty_remark_as_absent() {
+        let payload = friend_list(vec![friend_record(1, "甲", Some(""))]);
+        let profiles = extract_friend_profiles(&payload);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].remark, None);
+    }
+
+    #[test]
+    fn friend_list_skips_records_without_uid() {
+        // 没有 #1 的记录无法归属，必须丢弃而不是猜。
+        let record = concat(vec![field_bytes(F_FRIEND_NAME, "无主".as_bytes())]);
+        let payload = field_bytes(F_FRIEND_RECORD, &record);
+        assert!(extract_friend_profiles(&payload).is_empty());
+    }
+
+    #[test]
+    fn friend_list_rejects_garbage() {
+        assert!(extract_friend_profiles(&[0xff, 0xff, 0xff]).is_empty());
+    }
+
+    #[test]
+    fn wanted_cmds_include_friend_list() {
+        assert!(WANTED_CMDS.contains(&CMD_FRIEND_LIST));
     }
 
     /// 构造一条大厅聊天的完整信封。

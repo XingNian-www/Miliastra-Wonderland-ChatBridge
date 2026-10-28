@@ -262,7 +262,14 @@ async fn names(
     for (uid, name) in found {
         out.insert(uid.to_string(), json!(name));
     }
-    Json(json!({ "names": out })).into_response()
+    // 备注是新增字段：老客户端忽略即可；没设备注的 UID 不出现，
+    // 调用方不会把空串误当成“备注为空”。
+    let remarked = state.chat.remarks(&uids).await;
+    let mut remarks = serde_json::Map::new();
+    for (uid, remark) in remarked {
+        remarks.insert(uid.to_string(), json!(remark));
+    }
+    Json(json!({ "names": out, "remarks": remarks })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -738,6 +745,40 @@ mod tests {
             assert_eq!(value["error"]["code"], "bad_request");
             assert!(value["error"]["message"].is_string());
         }
+    }
+
+    #[tokio::test]
+    async fn names_endpoint_adds_remarks_without_changing_names() {
+        let state = app_state(true);
+        state
+            .chat
+            .record_friend_profiles(vec![
+                crate::extract::FriendProfile {
+                    uid: 100000001,
+                    name: Some("甲玩家".into()),
+                    remark: Some("rmkAAA1".into()),
+                },
+                crate::extract::FriendProfile {
+                    uid: 100000002,
+                    name: Some("乙玩家".into()),
+                    remark: None,
+                },
+            ])
+            .await;
+        let request = axum::http::Request::builder()
+            .uri("/names?uids=100000001,100000002")
+            .header("x-miliastra-token", "secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        // names 字段保持原语义，老客户端照旧可用。
+        assert_eq!(value["names"]["100000001"], "甲玩家");
+        assert_eq!(value["names"]["100000002"], "乙玩家");
+        // remarks 是新增字段，且只列有备注的 UID。
+        assert_eq!(value["remarks"]["100000001"], "rmkAAA1");
+        assert!(value["remarks"].get("100000002").is_none());
     }
 
     fn private_message() -> crate::extract::RawChat {

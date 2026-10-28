@@ -285,6 +285,10 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .msg-remark {
+    color: var(--muted);
+    font-weight: 400;
+  }
   .msg-text {
     min-width: 0;
     color: #dfe9f3;
@@ -443,7 +447,7 @@
       </select>
     </label>
     <label class="ctl grow" for="filter-text">搜索
-      <input id="filter-text" type="search" placeholder="昵称 / UID / 内容" autocomplete="off" spellcheck="false">
+      <input id="filter-text" type="search" placeholder="昵称 / 备注 / UID / 内容" autocomplete="off" spellcheck="false">
     </label>
     <label class="ctl check" for="follow"><input id="follow" type="checkbox" checked> 自动跟随</label>
     <button id="clear" class="btn" type="button" title="仅清空本地显示，不影响服务端缓冲">清空</button>
@@ -485,6 +489,14 @@
   var HEALTH_INTERVAL_MS = 5000;
   var BACKFILL_RETRY_MS = 5000;
   var SUCCESS_BANNER_MS = 4000;
+  /* 昵称/备注批量查询：去抖后合并成一次请求，避免每条消息都打 /names。 */
+  var REMARK_DEBOUNCE_MS = 400;
+  var REMARK_BATCH = 100;
+  /* 查询失败后的退避：2s 起翻倍，最长 60s；不做“失败即永久放弃”。 */
+  var REMARK_RETRY_BASE_MS = 2000;
+  var REMARK_RETRY_MAX_MS = 60000;
+  /* 已查到“无备注”的 UID：隔一段时间再问一次，接住服务端后补的备注。 */
+  var REMARK_REFRESH_MS = 30000;
   var WS_LABEL = {
     idle: '未连接',
     connecting: '连接中',
@@ -557,6 +569,12 @@
   var shownMessages = 0;
   var renderedRows = 0;
   var ignoreScrollUntil = 0;
+  /* uid -> { name, remark }；备注来自 /names 的 remarks，可能晚于消息到达。 */
+  var profiles = Object.create(null);
+  var pendingUids = Object.create(null);
+  var remarkTimer = null;
+  var remarkRetryTimer = null;
+  var remarkInFlight = false;
 
   function pad2(n) {
     return (n < 10 ? '0' : '') + n;
@@ -1062,6 +1080,17 @@
     lastHallKey = null;
     setHall(null);
     updateLastId(0);
+    /* 备注表跟着重置：桥接重启后服务端缓存也清空，旧备注可能已过时。 */
+    profiles = Object.create(null);
+    pendingUids = Object.create(null);
+    if (remarkTimer) {
+      clearTimeout(remarkTimer);
+      remarkTimer = null;
+    }
+    if (remarkRetryTimer) {
+      clearTimeout(remarkRetryTimer);
+      remarkRetryTimer = null;
+    }
     addSysEvent('restart', '桥接已重启，消息序号重置');
     updateRate();
   }
@@ -1122,6 +1151,7 @@
       lastServerLastId = numId;
       updateLastId(numId);
     }
+    requestProfile(normalized.from.uid, normalized.from.name);
     arrivals.push(Date.now());
     render();
   }
@@ -1153,6 +1183,169 @@
     return channel === 'private' ? '私聊' : '大厅';
   }
 
+  /* 是否该为这个 UID 发起查询。
+   *
+   * 没问过 → 问；问过但没拿到备注 → 到点再问（接住后补的备注）；
+   * 已经拿到备注 → 不再问。失败不会关掉重试，只是把下次时间往后推。
+   */
+  function shouldQueryProfile(entry, now) {
+    if (!entry.asked) return true;
+    if (entry.remark) return false;
+    return now >= entry.nextAt;
+  }
+
+  function requestProfile(uid, fallbackName) {
+    if (uid === null || uid === undefined) return;
+    var key = String(uid);
+    var now = Date.now();
+    var known = profiles[key];
+    if (known) {
+      /* 服务端可能后补昵称；只在本地还没有时才记。 */
+      if (!known.name && typeof fallbackName === 'string' && fallbackName) {
+        known.name = fallbackName;
+      }
+      if (shouldQueryProfile(known, now) && !pendingUids[key]) {
+        pendingUids[key] = true;
+        scheduleRemarkFetch();
+      }
+      return;
+    }
+    profiles[key] = {
+      name: typeof fallbackName === 'string' && fallbackName ? fallbackName : null,
+      remark: null,
+      asked: false,
+      attempts: 0,
+      nextAt: 0
+    };
+    pendingUids[key] = true;
+    scheduleRemarkFetch();
+  }
+
+  function scheduleRemarkFetch() {
+    if (remarkTimer || remarkInFlight) return;
+    remarkTimer = setTimeout(function () {
+      remarkTimer = null;
+      void fetchRemarks();
+    }, REMARK_DEBOUNCE_MS);
+  }
+
+  async function fetchRemarks() {
+    if (!token || unauthorized) return;
+    var keys = Object.keys(pendingUids);
+    if (!keys.length) return;
+    pendingUids = Object.create(null);
+    remarkInFlight = true;
+    var retryAt = 0;
+    var refreshAt = 0;
+    try {
+      for (var start = 0; start < keys.length; start += REMARK_BATCH) {
+        var batch = keys.slice(start, start + REMARK_BATCH);
+        var result = await requestJson(
+          '/names?uids=' + encodeURIComponent(batch.join(',')),
+          { headers: authHeaders(), timeoutMs: 8000 }
+        );
+        if (result.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        var ok = result.ok && result.data;
+        var names = ok && result.data.names && typeof result.data.names === 'object' ? result.data.names : {};
+        var remarks = ok && result.data.remarks && typeof result.data.remarks === 'object' ? result.data.remarks : {};
+        var changed = false;
+        var now = Date.now();
+        for (var i = 0; i < batch.length; i++) {
+          var uidKey = batch[i];
+          var entry = profiles[uidKey];
+          if (!entry) continue;
+          if (!ok) {
+            /* 失败：累加退避，下一次到点再问；绝不永久放弃。 */
+            entry.attempts = (entry.attempts || 0) + 1;
+            var backoff = Math.min(
+              REMARK_RETRY_BASE_MS * Math.pow(2, entry.attempts - 1),
+              REMARK_RETRY_MAX_MS
+            );
+            entry.asked = false;
+            entry.nextAt = now + backoff;
+            retryAt = retryAt ? Math.min(retryAt, entry.nextAt) : entry.nextAt;
+            continue;
+          }
+          var name = names[uidKey];
+          var remark = remarks[uidKey];
+          if (typeof name === 'string' && name && name !== entry.name) {
+            entry.name = name;
+            changed = true;
+          }
+          /* 没设备注时服务端不返回该键，保持 null。 */
+          var nextRemark = typeof remark === 'string' && remark ? remark : null;
+          if (nextRemark !== entry.remark) {
+            entry.remark = nextRemark;
+            changed = true;
+          }
+          entry.asked = true;
+          entry.attempts = 0;
+          /* 没有备注的条目：过一段时间再问，接住服务端后补的备注。
+           * 这里必须主动排一个刷新定时器——否则只有新消息才能触发，
+           * 而大厅安静时可能很久没有该 UID 的新消息。 */
+          entry.nextAt = nextRemark ? 0 : now + REMARK_REFRESH_MS;
+          if (!nextRemark) {
+            refreshAt = refreshAt ? Math.min(refreshAt, entry.nextAt) : entry.nextAt;
+          }
+        }
+        if (changed) render();
+      }
+    } catch (err) {
+      /* 备注是增强信息，失败不影响消息展示；下次消息到达会再试。 */
+      var failNow = Date.now();
+      var pendingKeys = keys.slice();
+      for (var k = 0; k < pendingKeys.length; k++) {
+        var failed = profiles[pendingKeys[k]];
+        if (!failed || failed.remark) continue;
+        failed.attempts = (failed.attempts || 0) + 1;
+        failed.nextAt = failNow + Math.min(
+          REMARK_RETRY_BASE_MS * Math.pow(2, failed.attempts - 1),
+          REMARK_RETRY_MAX_MS
+        );
+      }
+    } finally {
+      remarkInFlight = false;
+      if (retryAt) scheduleRemarkRetry(retryAt);
+      if (refreshAt) scheduleRemarkRetry(refreshAt);
+      if (Object.keys(pendingUids).length) scheduleRemarkFetch();
+    }
+  }
+
+  /* 失败退避：到点重试，且只重试仍缺备注的 UID。 */
+  function scheduleRemarkRetry(at) {
+    if (remarkRetryTimer) return;
+    var delay = Math.max(0, at - Date.now());
+    remarkRetryTimer = setTimeout(function () {
+      remarkRetryTimer = null;
+      if (!token || unauthorized) return;
+      var now = Date.now();
+      var keys = Object.keys(profiles);
+      var queued = false;
+      for (var i = 0; i < keys.length; i++) {
+        var entry = profiles[keys[i]];
+        if (!entry || entry.remark) continue;
+        if (!shouldQueryProfile(entry, now)) continue;
+        pendingUids[keys[i]] = true;
+        queued = true;
+      }
+      if (queued) scheduleRemarkFetch();
+    }, delay);
+  }
+
+  /* 消息发送者最终显示的名字：消息自带的昵称优先，其次用 /names 回填的昵称。 */
+  function displayName(message) {
+    var from = message.from && typeof message.from === 'object' ? message.from : {};
+    var name = typeof from.name === 'string' ? from.name : '';
+    if (name) return name;
+    var uid = from.uid === null || from.uid === undefined ? '' : String(from.uid);
+    if (!uid) return '';
+    var profile = profiles[uid];
+    return profile && profile.name ? profile.name : '';
+  }
+
   function buildMessageRow(message) {
     var channel = channelOf(message);
     var row = document.createElement('div');
@@ -1173,9 +1366,28 @@
     sender.className = 'msg-sender';
     var from = message.from && typeof message.from === 'object' ? message.from : {};
     var uid = from.uid === null || from.uid === undefined ? '' : String(from.uid);
-    var name = typeof from.name === 'string' ? from.name : '';
-    sender.textContent = name ? name : (uid ? 'UID ' + uid : '未知发送者');
-    sender.title = uid ? 'UID ' + uid : 'UID 未知';
+    var name = displayName(message);
+    var profile = uid ? profiles[uid] : null;
+    var remark = profile && profile.remark ? profile.remark : '';
+    sender.textContent = '';
+    if (name) {
+      sender.appendChild(document.createTextNode(name));
+    } else if (uid) {
+      sender.appendChild(document.createTextNode('UID ' + uid));
+    } else {
+      sender.appendChild(document.createTextNode('未知发送者'));
+    }
+    if (remark) {
+      /* 备注是玩家自起的名字，和昵称分开显示，避免被当成身份。 */
+      var remarkEl = document.createElement('span');
+      remarkEl.className = 'msg-remark';
+      remarkEl.textContent = '（' + remark + '）';
+      sender.appendChild(remarkEl);
+    }
+    var titleParts = [];
+    if (uid) titleParts.push('UID ' + uid);
+    if (remark) titleParts.push('备注 ' + remark);
+    sender.title = titleParts.length ? titleParts.join(' · ') : 'UID 未知';
 
     var text = document.createElement('span');
     text.className = 'msg-text';
@@ -1225,10 +1437,14 @@
       if (channel !== 'all' && channelOf(message) !== channel) continue;
       if (query) {
         var from = message.from || {};
-        var name = typeof from.name === 'string' ? from.name : '';
         var uid = from.uid === null || from.uid === undefined ? '' : String(from.uid);
         var text = typeof message.text === 'string' ? message.text : '';
+        var profile = uid ? profiles[uid] : null;
+        var remark = profile && profile.remark ? profile.remark : '';
+        /* 搜索和渲染必须用同一个名字来源，否则会出现“看得到却搜不到”。 */
+        var name = displayName(message);
         if (name.toLowerCase().indexOf(query) === -1
+          && remark.toLowerCase().indexOf(query) === -1
           && uid.indexOf(query) === -1
           && text.toLowerCase().indexOf(query) === -1) {
           continue;

@@ -295,38 +295,15 @@ fn serve_once(
 }
 
 fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
-    // 好友列表走独立 cmd，结构既不是信封也不是消息体，单独处理。
-    if cmd == extract::CMD_FRIEND_LIST {
-        let profiles = extract::extract_friend_profiles(payload);
-        if profiles.is_empty() {
-            return;
-        }
-        // 只在进游戏全量那次有几十条；懒加载增量通常一两条。
-        let remarked = profiles.iter().filter(|p| p.remark.is_some()).count();
-        let total = profiles.len();
-        tokio::runtime::Handle::current().block_on(async {
-            let baseline = chat.record_friend_profiles(profiles).await;
-            tracing::info!(
-                "4410 好友列表{}: {} 条记录，其中 {} 条带备注，累计备注 {} 条",
-                if baseline {
-                    "（全量基线）"
-                } else {
-                    "（增量"
-                },
-                total,
-                remarked,
-                chat.remark_count().await
-            );
-        });
-        return;
-    }
     // 独立 486 只承载私聊；信封 2246 才有多路复用内容。
-    let (halls, names, population, chats) = if cmd == extract::CMD_PRIVATE_DIRECT {
+    // 好友列表（含备注）也在 2246 信封内部（内层 #13=4410），跟着信封一起解析。
+    let (halls, names, population, chats, profiles) = if cmd == extract::CMD_PRIVATE_DIRECT {
         (
             None,
             Vec::new(),
             None,
             extract::extract_direct_private(payload),
+            Vec::new(),
         )
     } else {
         (
@@ -334,16 +311,23 @@ fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
             extract::extract_names(payload),
             extract::extract_population_hall(payload),
             extract::extract_chats(payload),
+            extract::extract_friend_profiles(payload),
         )
     };
     tracing::debug!(
-        "2246 解析: hall={:?} names={} pop={:?} chats={}",
+        "2246 解析: hall={:?} names={} pop={:?} chats={} profiles={}",
         halls,
         names.len(),
         population,
-        chats.len()
+        chats.len(),
+        profiles.len()
     );
-    if halls.is_none() && names.is_empty() && population.is_none() && chats.is_empty() {
+    if halls.is_none()
+        && names.is_empty()
+        && population.is_none()
+        && chats.is_empty()
+        && profiles.is_empty()
+    {
         return;
     }
     // 阻塞线程里没有 tokio 上下文，用 Handle::block_on 进入运行时。
@@ -351,6 +335,20 @@ fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
     handle.block_on(async {
         if !names.is_empty() {
             chat.record_names(names).await;
+        }
+        if !profiles.is_empty() {
+            // 进游戏全量一次、之后懒加载增量；只在全量那次打 info，避免刷日志。
+            let remarked = profiles.iter().filter(|p| p.remark.is_some()).count();
+            let total = profiles.len();
+            let baseline = chat.record_friend_profiles(profiles).await;
+            if baseline {
+                tracing::info!(
+                    "好友列表（全量基线）: {total} 条记录，其中 {remarked} 条带备注，累计备注 {} 条",
+                    chat.remark_count().await
+                );
+            } else {
+                tracing::debug!("好友列表（增量）: {total} 条记录，其中 {remarked} 条带备注");
+            }
         }
         if let Some(hall_id) = population {
             chat.note_population_hall(hall_id).await;

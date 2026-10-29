@@ -18,6 +18,7 @@ mod proto;
 mod server;
 mod state;
 
+mod game_path;
 #[cfg(windows)]
 mod inject;
 
@@ -55,7 +56,7 @@ fn main() -> Result<()> {
         cfg.self_uid
     );
     if args.diagnose {
-        return diagnose(&cfg);
+        return diagnose(&cfg, args.game_path.as_deref());
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -107,7 +108,7 @@ fn main() -> Result<()> {
             let cancelled = Arc::clone(&cancelled);
             async move {
                 if !args.auto_launch { return std::future::pending::<Result<()>>().await; }
-                inject::run(chat, connected, Arc::clone(&packets), args.auto_launch, args.spawn_only, args.lib_only, cancelled).await
+                inject::run(chat, connected, Arc::clone(&packets), args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), cancelled).await
             }
         };
         #[cfg(not(windows))]
@@ -253,8 +254,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeWriter {
 /// 启动前自检：在拉起游戏之前把"环境不对"暴露出来。
 ///
 /// 只读文件 + 占用一次端口做冲突检测；不启动游戏、不注入、不改任何状态。
-fn diagnose(cfg: &config::Config) -> Result<()> {
+fn diagnose(cfg: &config::Config, game_path: Option<&std::path::Path>) -> Result<()> {
     use std::path::PathBuf;
+
+    // 只有 Windows 的自检会用游戏路径做校验；其它平台避免 unused 警告。
+    #[cfg(not(windows))]
+    let _ = game_path;
 
     println!(
         "ChatBridge 自检  version={}  port={}  selfUid={}",
@@ -321,7 +326,7 @@ fn diagnose(cfg: &config::Config) -> Result<()> {
     });
 
     #[cfg(windows)]
-    checks.push(game_check(&metadata_path));
+    checks.push(game_check(&metadata_path, game_path));
 
     let mut failures = 0usize;
     for (ok, detail) in &checks {
@@ -339,23 +344,18 @@ fn diagnose(cfg: &config::Config) -> Result<()> {
 
 /// 校验游戏 exe：找得到、能算出 CRC、metadata 里有完整 RVA 表。
 #[cfg(windows)]
-fn game_check(metadata_path: &std::path::Path) -> (bool, String) {
+fn game_check(
+    metadata_path: &std::path::Path,
+    game_path: Option<&std::path::Path>,
+) -> (bool, String) {
     use anyhow::Context as _;
-    let candidates = [
-        r"D:\Genshin Impact Game\YuanShen.exe",
-        r"C:\Program Files\Genshin Impact\Genshin Impact Game\GenshinImpact.exe",
-        r"C:\Program Files\Genshin Impact\Genshin Impact Game\YuanShen.exe",
-    ];
-    let Some(game) = candidates
-        .iter()
-        .map(std::path::Path::new)
-        .find(|path| path.is_file())
-    else {
-        return (
-            false,
-            "未找到游戏可执行文件（YuanShen.exe / GenshinImpact.exe）".into(),
-        );
+    // 与注入路径共用同一套查找（--game-path → 注册表 → 默认位置），
+    // 否则自检和真正启动可能指向不同的 exe。
+    let game = match crate::inject::locate_game(game_path) {
+        Ok(game) => game,
+        Err(error) => return (false, format!("{error:#}")),
     };
+    let game = game.as_path();
     let check = (|| -> anyhow::Result<(u32, bool)> {
         use std::io::Read as _;
         let mut head = vec![0u8; 65536];
@@ -423,6 +423,11 @@ mod clap_free_args {
         pub capture_dir: Option<PathBuf>,
         /// raw 抓包总字节上限（MiB），默认 1024。
         pub capture_max_mib: u64,
+        /// 显式指定游戏可执行文件或其所在目录。
+        ///
+        /// 不填时按启动器注册表自动查找（与 Miliastra-Wonderland-Music 一致），
+        /// 再退回常见默认安装位置。
+        pub game_path: Option<PathBuf>,
     }
 
     impl Args {
@@ -440,6 +445,7 @@ mod clap_free_args {
             let mut debug_packets = false;
             let mut capture_dir: Option<PathBuf> = None;
             let mut capture_max_mib = 1024u64;
+            let mut game_path: Option<PathBuf> = None;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--config" => {
@@ -480,6 +486,11 @@ mod clap_free_args {
                             value.parse().context("--capture-max-mib 必须是正整数")?;
                         anyhow::ensure!(capture_max_mib > 0, "--capture-max-mib 必须大于 0");
                     }
+                    "--game-path" => {
+                        game_path = Some(PathBuf::from(
+                            args.next().context("--game-path 需要路径参数")?,
+                        ));
+                    }
                     "--version" | "-V" => {
                         println!(
                             "Miliastra-Wonderland-ChatBridge {}",
@@ -489,7 +500,7 @@ mod clap_free_args {
                     }
                     "--help" | "-h" => {
                         println!(
-                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
+                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--game-path <exe|dir>] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
                         );
                         std::process::exit(0);
                     }
@@ -510,6 +521,7 @@ mod clap_free_args {
                 debug_packets,
                 capture_dir,
                 capture_max_mib,
+                game_path,
             })
         }
     }

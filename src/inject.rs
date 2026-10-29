@@ -43,6 +43,7 @@ fn pipe_path_named(name: &str) -> Vec<u16> {
 /// 启动注入并持续接收数据。
 ///
 /// 单次会话；阻塞工作通过取消标志和短周期轮询退出。
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     chat: Arc<ChatState>,
     connected: Arc<AtomicBool>,
@@ -50,6 +51,7 @@ pub async fn run(
     auto_launch: bool,
     spawn_only: bool,
     lib_only: bool,
+    game_path: Option<std::path::PathBuf>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
@@ -62,6 +64,7 @@ pub async fn run(
             auto_launch,
             spawn_only,
             lib_only,
+            game_path.as_deref(),
             &cancelled,
         );
         connected.store(false, Ordering::Relaxed);
@@ -109,6 +112,7 @@ fn wait_for_pipe_data(stream: &std::fs::File) -> Result<bool> {
 }
 
 /// 一次完整的注入会话。
+#[allow(clippy::too_many_arguments)]
 fn serve_once(
     chat: &ChatState,
     connected: &AtomicBool,
@@ -116,6 +120,7 @@ fn serve_once(
     auto_launch: bool,
     spawn_only: bool,
     lib_only: bool,
+    game_path: Option<&std::path::Path>,
     cancelled: &AtomicBool,
 ) -> Result<()> {
     use std::io::{Read, Write};
@@ -125,7 +130,7 @@ fn serve_once(
     if !auto_launch {
         return Ok(());
     }
-    let exe = locate_game()?;
+    let exe = locate_game(game_path)?;
 
     // 必须先确认游戏没在运行。
     //
@@ -688,23 +693,94 @@ fn resolve_rva(exe: &std::path::Path) -> Result<crate::metadata::MethodRva> {
     Ok(table.clone())
 }
 
-/// metadata.bin 的位置（与程序同目录）。
-fn locate_game() -> Result<std::path::PathBuf> {
-    // 国服客户端通常是 YuanShen.exe，国际服是 GenshinImpact.exe。
-    let candidates = [
-        r"D:\Genshin Impact Game\YuanShen.exe",
-        r"C:\Program Files\Genshin Impact\Genshin Impact Game\GenshinImpact.exe",
-        r"C:\Program Files\Genshin Impact\Genshin Impact Game\YuanShen.exe",
-    ];
-    for path in candidates {
-        let path = std::path::Path::new(path);
-        if path.is_file() {
-            return Ok(path.to_path_buf());
+/// 从启动器注册表读安装目录。
+///
+/// 与 Miliastra-Wonderland-Music 完全一致的两条键：
+///   HKCU\Software\miHoYo\HYP\1_1\hk4e_cn        （国服）
+///   HKCU\Software\Cognosphere\HYP\1_0\hk4e_global（国际服）
+/// 值名都是 GameInstallPath，类型 REG_SZ。
+#[cfg(windows)]
+fn registry_install_dirs() -> Vec<std::path::PathBuf> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};
+
+    /// 读一个 REG_SZ 值；不存在或类型不符都返回 None。
+    fn read_string(subkey: &str, value: &str) -> Option<String> {
+        let subkey: Vec<u16> = subkey.encode_utf16().chain(Some(0)).collect();
+        let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+        let mut bytes = 0u32;
+        // 先问长度。失败说明键/值不存在，直接放弃。
+        // SAFETY: 空数据指针是查询长度模式的约定用法。
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if status != 0 || bytes == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+        // SAFETY: 缓冲区按刚查到的字节数分配。
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let len = buffer
+            .iter()
+            .position(|ch| *ch == 0)
+            .unwrap_or(buffer.len());
+        let text = String::from_utf16_lossy(&buffer[..len]);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
         }
     }
-    anyhow::bail!("未找到游戏可执行文件（YuanShen.exe / GenshinImpact.exe）")
+
+    [
+        r"Software\miHoYo\HYP\1_1\hk4e_cn",
+        r"Software\Cognosphere\HYP\1_0\hk4e_global",
+    ]
+    .into_iter()
+    .filter_map(|key| read_string(key, "GameInstallPath"))
+    .map(std::path::PathBuf::from)
+    .collect()
 }
 
+#[cfg(not(windows))]
+fn registry_install_dirs() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// 找到游戏可执行文件。
+///
+/// 优先级与 Miliastra-Wonderland-Music 保持一致：
+///   1. 显式指定的 --game-path（文件或目录）
+///   2. 启动器注册表里的安装目录（国服 / 国际服）
+///   3. 常见默认安装位置
+///
+/// 之前这里是三处硬编码路径，换个盘或非默认安装就找不到游戏。
+pub(crate) fn locate_game(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    crate::game_path::resolve(explicit, registry_install_dirs())
+}
+
+/// metadata.bin 的位置（与程序同目录）。
 fn locate_metadata() -> Result<std::path::PathBuf> {
     let exe_dir = std::env::current_exe()?;
     let dir = exe_dir.parent().unwrap_or(std::path::Path::new("."));

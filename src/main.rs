@@ -18,6 +18,7 @@ mod proto;
 mod server;
 mod state;
 
+mod exit_code;
 mod game_path;
 #[cfg(windows)]
 mod inject;
@@ -29,7 +30,28 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap_free_args::Args;
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // 退出原因既进日志也进 stderr：隐藏窗口下 stderr 是 NUL，
+            // 但上游可以靠退出码判断该不该人工介入。
+            tracing::error!("{error:#}");
+            eprintln!("{error:#}");
+            std::process::ExitCode::from(exit_code_of(&error))
+        }
+    }
+}
+
+/// 把错误映射成进程退出码，供上游区分「等玩家退出」与「必须人工处理」。
+fn exit_code_of(error: &anyhow::Error) -> u8 {
+    let code = exit_code::classify(error);
+    tracing::info!("退出码 {code}：{}", exit_code::describe(code));
+    code as u8
+}
+
+/// 实际的启动与主循环；错误在这里向上抛，由 main 决定退出码。
+fn run() -> Result<()> {
     let args = Args::parse(std::env::args().skip(1))?;
     let log_file = if args.no_log_file {
         None
@@ -167,9 +189,24 @@ fn init_tracing(log_file: Option<std::path::PathBuf>) {
 ///
 /// 为什么需要文件：程序通常被 Music 以隐藏窗口拉起，stdout/stderr 指向 NUL，
 /// 只靠控制台观察等于没有日志。文件层让"事后回看"成为可能。
+/// 日志文件句柄 + 运行期滚动所需的路径与已写字节数。
+///
+/// 不实现 Clone：内部持有 File，整个结构被 Mutex 独占。
+struct LogFile {
+    file: Option<std::fs::File>,
+    path: std::path::PathBuf,
+    written: u64,
+}
+
+/// 滚动检查的间隔写入量：每写这么多字节就核对一次文件大小。
+///
+/// 不必每次 write 都 stat（日志热路径），也不能只在启动时检查一次——
+/// 之前就是后者，导致 8 MiB 之后无界追加直到磁盘满。
+const LOG_ROTATE_CHECK_BYTES: u64 = 256 * 1024;
+
 #[derive(Clone, Default)]
 struct TeeWriter {
-    file: Option<std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>>,
+    file: Option<std::sync::Arc<std::sync::Mutex<Option<LogFile>>>>,
 }
 
 impl TeeWriter {
@@ -194,7 +231,11 @@ impl TeeWriter {
             .open(path)
         {
             Ok(file) => Self {
-                file: Some(std::sync::Arc::new(std::sync::Mutex::new(Some(file)))),
+                file: Some(std::sync::Arc::new(std::sync::Mutex::new(Some(LogFile {
+                    file: Some(file),
+                    path: path.to_path_buf(),
+                    written: 0,
+                })))),
             },
             Err(error) => {
                 eprintln!(
@@ -221,13 +262,54 @@ fn rotate_log(path: &std::path::Path) {
     let _ = std::fs::rename(path, rotated);
 }
 
+/// 把内容写进日志文件，必要时先滚动。
+///
+/// 滚动失败不影响写日志：宁可继续往旧文件追加，也不能把日志整条丢掉。
+/// 写失败要报到 stderr —— 之前用 `let _` 吞掉，磁盘满之后完全静默。
+fn write_rolled(log: &mut LogFile, buf: &[u8]) {
+    use std::io::Write as _;
+    if log.written >= LOG_ROTATE_CHECK_BYTES {
+        log.written = 0;
+        let too_big = std::fs::metadata(&log.path)
+            .map(|meta| meta.len() >= LOG_ROTATE_BYTES)
+            .unwrap_or(false);
+        if too_big {
+            // 先关句柄再改名：Windows 上打开中的文件无法 rename。
+            log.file = None;
+            rotate_log(&log.path);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log.path)
+            {
+                Ok(file) => log.file = Some(file),
+                Err(error) => {
+                    eprintln!("日志重新打开失败（后续只写 stderr）: {error}");
+                }
+            }
+        }
+    }
+    let Some(file) = log.file.as_mut() else {
+        return;
+    };
+    if let Err(error) = file.write_all(buf) {
+        eprintln!("日志写入失败（后续只写 stderr）: {error}");
+        log.file = None;
+        return;
+    }
+    log.written = log.written.saturating_add(buf.len() as u64);
+}
+
 impl std::io::Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(file) = &self.file
             && let Ok(mut guard) = file.lock()
-            && let Some(file) = guard.as_mut()
+            && let Some(log) = guard.as_mut()
         {
-            let _ = file.write_all(buf);
+            write_rolled(log, buf);
+            if let Err(error) = log.file.as_mut().map(|file| file.flush()).unwrap_or(Ok(())) {
+                eprintln!("日志刷新失败: {error}");
+            }
         }
         std::io::stderr().write(buf)
     }
@@ -235,7 +317,8 @@ impl std::io::Write for TeeWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         if let Some(file) = &self.file
             && let Ok(mut guard) = file.lock()
-            && let Some(file) = guard.as_mut()
+            && let Some(log) = guard.as_mut()
+            && let Some(file) = log.file.as_mut()
         {
             let _ = file.flush();
         }

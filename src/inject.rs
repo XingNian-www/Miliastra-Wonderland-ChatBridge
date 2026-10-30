@@ -139,10 +139,12 @@ fn serve_once(
     // 而 CreateProcess(CREATE_SUSPENDED) 拿到的是"创建者句柄"，不受该拦截。
     // 因此只能自己拉起游戏，绝不能在游戏已运行时再启动第二个实例。
     if let Some(existing) = open_running_game() {
-        anyhow::bail!(
-            "游戏已在运行 (pid={})，但反作弊会拦截外部注入。请先退出游戏，本服务会自己拉起它",
-            existing
+        let code = crate::exit_code::code_of(crate::exit_code::Kind::GameAlreadyRunning);
+        tracing::error!(
+            "游戏已在运行 (pid={existing})，但反作弊会拦截外部注入。\
+             请先退出游戏，本服务会自己拉起它。退出码 {code}（等玩家退出即可，无需人工修复）"
         );
+        return Err(crate::exit_code::Marked(crate::exit_code::Kind::GameAlreadyRunning).into());
     }
     if spawn_only || lib_only {
         let proc = spawn_suspended(&exe)?;
@@ -227,9 +229,7 @@ fn serve_once(
                 continue;
             }
             PipeState::Closed => {
-                tracing::info!("对端已关闭，结束会话");
-                crate::diag::note("pipe_closed", "host observed peer close");
-                return Ok(());
+                return Err(session_end_error(&proc, "对端已关闭").into());
             }
         }
         let mut chunk = [0u8; 4096];
@@ -242,8 +242,7 @@ fn serve_once(
             Err(error) => return Err(error).context("读管道失败"),
         };
         if read == 0 {
-            tracing::info!("管道返回 0 字节，对端已关闭");
-            return Ok(());
+            return Err(session_end_error(&proc, "管道返回 0 字节").into());
         }
         last_data_at = std::time::Instant::now();
         crate::diag::frame(read);
@@ -1164,6 +1163,24 @@ fn inject_dll(
 }
 
 /// 进程是否还活着。
+/// 注入会话断开时判定该报哪种错误。
+///
+/// 游戏还活着 = 链路彻底失效且无法重新注入，必须让上游知道要人工重启游戏；
+/// 游戏已退出 = 正常结束，上游下一轮可以直接重新拉起。
+fn session_end_error(proc: &SuspendedProcess, reason: &str) -> anyhow::Error {
+    crate::diag::note("pipe_closed", "host observed peer close");
+    if process_alive(proc.process) {
+        let code = crate::exit_code::code_of(crate::exit_code::Kind::SessionLostGameAlive);
+        tracing::error!(
+            "{reason}，但游戏进程仍在运行 —— 外部聊天源已失效，必须重启游戏才能恢复。退出码 {code}"
+        );
+        crate::exit_code::Marked(crate::exit_code::Kind::SessionLostGameAlive).into()
+    } else {
+        tracing::info!("{reason}，游戏已退出，结束会话");
+        crate::exit_code::Marked(crate::exit_code::Kind::GameExited).into()
+    }
+}
+
 fn process_alive(process: windows_sys::Win32::Foundation::HANDLE) -> bool {
     use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;

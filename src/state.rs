@@ -24,6 +24,63 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// "我在哪个大厅"时就先排掉公共频道，减少噪音与误判。
 pub const PUBLIC_CHANNEL_HALL_TYPE: u32 = 23;
 
+/// ingest 期间收集的待打印日志。
+///
+/// 为什么不在写锁内直接 `tracing::info!`：`TeeWriter` 是同步文件 IO，
+/// 写盘会把 `ChatState` 写锁的持有时间放大，`/messages`、`/health` 与
+/// DLL 侧 ACK 都被拖住。因此锁内只记录"哪条消息要打哪类日志"，
+/// 锁释放后再用下方 `emit` 展开（format + 同步写盘）。
+///
+/// 文本通过下标借用 `raws`，所以锁内既不需要格式化，也不需要为打印
+/// clone 消息正文；日志内容与旧实现逐字相同。
+enum IngestLog {
+    /// 公共频道（hall_type=23）被丢弃。
+    PublicDiscard { index: usize },
+    /// 自己发言：只更新大厅，不作为命令推送。
+    OwnMessage { index: usize },
+    /// 跟随消息切换了当前大厅（只在已知旧大厅时打印，与旧实现一致）。
+    HallFollow { hall_id: u64, hall_type: u32 },
+    /// 已推送的消息。
+    Dispatch { index: usize, channel: Channel },
+}
+
+impl IngestLog {
+    /// 展开日志：**必须**在 `ChatState` 写锁释放后调用。
+    ///
+    /// 这里的 `tracing` 调用会同步写文件；放在锁内会重新引入审计指出的
+    /// "持锁做日志 IO"问题。
+    fn emit(&self, raws: &[RawChat]) {
+        match self {
+            Self::PublicDiscard { index } => {
+                let raw = &raws[*index];
+                tracing::info!(
+                    "[丢弃-公共频道] hall={:?} from={} ts={} text={:?}",
+                    raw.hall_id,
+                    raw.from_uid,
+                    raw.ts,
+                    raw.text
+                );
+            }
+            Self::OwnMessage { index } => {
+                tracing::debug!("跳过自己发的消息: {:?}", raws[*index].text);
+            }
+            Self::HallFollow { hall_id, hall_type } => {
+                tracing::info!("跟随消息切换当前大厅: {hall_id} type={hall_type}");
+            }
+            Self::Dispatch { index, channel } => {
+                let raw = &raws[*index];
+                tracing::info!(
+                    "推送消息: channel={:?} hall={:?} from={} text={:?}",
+                    channel,
+                    raw.hall_id,
+                    raw.from_uid,
+                    raw.text
+                );
+            }
+        }
+    }
+}
+
 /// 全局聊天状态。
 pub struct ChatState {
     inner: RwLock<Inner>,
@@ -162,22 +219,23 @@ impl ChatState {
     }
 
     /// 处理一批原始消息。
+    ///
+    /// 锁边界：批量处理与事件发布仍在写锁内（保持并发 ingest 与订阅水位
+    /// 的事件顺序）；但所有日志（format + tracing 的同步写盘）都推迟到
+    /// `drop(inner)` 之后，避免日志 IO 占住写锁、拖慢 /messages、/health
+    /// 以及 DLL 侧等待的 ACK。
     pub async fn ingest(&self, raws: Vec<RawChat>) {
         if raws.is_empty() {
             return;
         }
         let mut inner = self.inner.write().await;
         let mut events = Vec::new();
-        for raw in raws {
+        // 锁内只记下标与小字段：不含 String，不做 format，不做任何 IO。
+        let mut logs = Vec::new();
+        for (index, raw) in raws.iter().enumerate() {
             // 包括自己发言在内，公共频道都不能影响当前大厅。
             if !raw.is_private && raw.hall_type == Some(PUBLIC_CHANNEL_HALL_TYPE) {
-                tracing::info!(
-                    "[丢弃-公共频道] hall={:?} from={} ts={} text={:?}",
-                    raw.hall_id,
-                    raw.from_uid,
-                    raw.ts,
-                    raw.text
-                );
+                logs.push(IngestLog::PublicDiscard { index });
                 continue;
             }
             // 自己发的消息：只用于更新"当前大厅"，不作为命令推送给 BOT。
@@ -191,7 +249,7 @@ impl ChatState {
                 events.push(ServerEvent::HallChanged { hall_id, hall_type });
             }
             if from_self {
-                tracing::debug!("跳过自己发的消息: {:?}", raw.text);
+                logs.push(IngestLog::OwnMessage { index });
                 continue;
             }
             let channel = if raw.is_private {
@@ -206,20 +264,14 @@ impl ChatState {
                     && inner.current_hall != Some((hall_id, hall_type))
                 {
                     if inner.current_hall.is_some() {
-                        tracing::info!("跟随消息切换当前大厅: {hall_id} type={hall_type}");
+                        logs.push(IngestLog::HallFollow { hall_id, hall_type });
                     }
                     inner.current_hall = Some((hall_id, hall_type));
                     events.push(ServerEvent::HallChanged { hall_id, hall_type });
                 }
                 Channel::CurrentHall
             };
-            tracing::info!(
-                "推送消息: channel={:?} hall={:?} from={} text={:?}",
-                channel,
-                raw.hall_id,
-                raw.from_uid,
-                raw.text
-            );
+            logs.push(IngestLog::Dispatch { index, channel });
             let id = inner.next_id;
             inner.next_id += 1;
             let name = inner.names.get(&raw.from_uid).cloned();
@@ -234,7 +286,9 @@ impl ChatState {
                     name,
                 },
                 to: raw.to_uid,
-                text: raw.text,
+                // raws 要活到锁外打日志，这里只复制正文（String）；
+                // 这是消息本体的必需字段，不是为打印而 clone 整条消息。
+                text: raw.text.clone(),
             };
             inner.last_id = id;
             crate::diag::message(id, raw.ts);
@@ -250,12 +304,19 @@ impl ChatState {
             // 没有订阅者时 send 会失败，这是正常情况。
             let _ = self.tx.send(event);
         }
+        // 关键：先释放写锁再打印。tracing 的 TeeWriter 是同步文件 IO，
+        // 留在锁内会放大锁持有时间，并可能让 DLL 侧等不到 ACK 而超时。
+        drop(inner);
+        for log in logs {
+            log.emit(&raws);
+        }
     }
 
     /// 记录 7154 包给出的当前大厅（补充信号）。
+    ///
+    /// 日志同样放在写锁之外：7154 可能高频到达，不能让同步写盘占住写锁。
     pub async fn note_population_hall(&self, hall_id: u64) {
         let mut inner = self.inner.write().await;
-        tracing::info!("7154 人数包给出当前大厅: {hall_id}");
         let hall_type = inner.current_hall.map(|(_, ty)| ty).unwrap_or(0);
         if inner.current_hall.map(|(id, _)| id) != Some(hall_id) {
             inner.current_hall = Some((hall_id, hall_type));
@@ -263,12 +324,16 @@ impl ChatState {
                 .tx
                 .send(ServerEvent::HallChanged { hall_id, hall_type });
         }
+        drop(inner);
+        tracing::info!("7154 人数包给出当前大厅: {hall_id}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn raw(text: &str, from: u32, hall: Option<u64>, private: bool) -> RawChat {
         RawChat {
@@ -564,5 +629,160 @@ mod tests {
         let (msgs, _, _) = state.messages_since(0, 10).await;
         // 消息只带昵称：备注是不能作为身份判断的展示名。
         assert_eq!(msgs[0].from.name.as_deref(), Some("昵称"));
+    }
+
+    /// 日志探针：统计事件数量，并检查事件到达时 ChatState 写锁是否已释放。
+    ///
+    /// `try_write` 成功 = 写锁空闲；失败 = 事件仍在写锁临界区内（旧行为，
+    /// 正是审计要消除的"持锁做日志 IO"）。
+    ///
+    /// 为什么装**全局** subscriber：tracing 的 callsite interest 是进程级
+    /// 缓存，scoped subscriber 无法可靠接管已被并行测试线程注册成 never 的
+    /// callsite（会让日志事件偶发丢失）。全局安装 + 重建 interest 缓存后，
+    /// 所有 callsite 都注册到本探针；再用线程 id 过滤，只统计当前测试线程。
+    #[derive(Clone)]
+    struct LogProbe {
+        state: std::sync::Weak<ChatState>,
+        owner_thread: std::thread::ThreadId,
+        events: Arc<AtomicUsize>,
+        events_under_lock: Arc<AtomicUsize>,
+        messages: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct ProbeLayer(LogProbe);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let probe = &self.0;
+            // 全局 subscriber 会收到所有测试线程的事件；只处理本测试线程的。
+            if std::thread::current().id() != probe.owner_thread {
+                return;
+            }
+            let Some(state) = probe.state.upgrade() else {
+                return;
+            };
+            probe.events.fetch_add(1, Ordering::Relaxed);
+            if state.inner.try_write().is_err() {
+                probe.events_under_lock.fetch_add(1, Ordering::Relaxed);
+            }
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            if let Some(message) = visitor.message {
+                probe.messages.lock().unwrap().push(message);
+            }
+        }
+    }
+
+    /// 安装进程级日志探针（整个测试进程只装一次）。
+    fn install_log_probe(probe: LogProbe) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(ProbeLayer(probe));
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("安装测试用全局 tracing subscriber 失败");
+            // 之前可能已有 callsite 在无 subscriber 时被缓存为 never，重建。
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
+    /// 只取 tracing 事件的 `message` 字段（即日志正文）。
+    #[derive(Default)]
+    struct MessageVisitor {
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// 回归测试：ingest 的日志必须在写锁释放后发出，且内容与旧实现等价。
+    #[tokio::test]
+    async fn ingest_logs_after_releasing_write_lock() {
+        let state = ChatState::new(999);
+        let probe = LogProbe {
+            state: Arc::downgrade(&state),
+            owner_thread: std::thread::current().id(),
+            events: Arc::new(AtomicUsize::new(0)),
+            events_under_lock: Arc::new(AtomicUsize::new(0)),
+            messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        install_log_probe(probe.clone());
+        let events = Arc::clone(&probe.events);
+        let events_under_lock = Arc::clone(&probe.events_under_lock);
+        let messages = Arc::clone(&probe.messages);
+
+        let mut public = raw("跨厅喊话", 1, Some(100000008), false);
+        public.hall_type = Some(PUBLIC_CHANNEL_HALL_TYPE);
+        state
+            .ingest(vec![
+                public,                             // 丢弃公共频道 → info
+                raw("mine", 999, Some(100), false), // 跳过自己 → debug
+                raw("hello", 1, None, true),        // 推送私聊 → info
+                raw("moved", 1, Some(200), false),  // 跟随大厅 → info + 推送 info
+            ])
+            .await;
+        // 先确认业务行为没变：公共频道与自己发言不推送，其余按 id 入队。
+        assert_eq!(state.last_id().await, 2, "入队逻辑与顺序必须保持不变");
+        assert_eq!(state.current_hall().await, Some((200, 16)));
+        // 7154 只更新大厅，不产生消息（既有语义），日志同样应在锁外。
+        state.note_population_hall(300).await;
+        assert_eq!(state.current_hall().await, Some((300, 16)));
+
+        // 5 条来自 ingest（丢弃/跳过/推送/跟随/推送）+ 1 条 7154。
+        assert_eq!(events.load(Ordering::Relaxed), 6, "日志: {messages:?}");
+        assert_eq!(
+            events_under_lock.load(Ordering::Relaxed),
+            0,
+            "日志不得在 ChatState 写锁内发出"
+        );
+
+        let messages = messages.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("[丢弃-公共频道]") && m.contains("跨厅喊话")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("跳过自己发的消息") && m.contains("mine")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("推送消息")
+                && m.contains("channel=Private")
+                && m.contains("from=1")
+                && m.contains("hello")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("跟随消息切换当前大厅: 200 type=16")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("推送消息")
+                && m.contains("channel=CurrentHall")
+                && m.contains("moved")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("7154 人数包给出当前大厅: 300")),
+            "{messages:?}"
+        );
     }
 }

@@ -24,8 +24,8 @@ mod game_path;
 mod inject;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap_free_args::Args;
@@ -48,6 +48,131 @@ fn exit_code_of(error: &anyhow::Error) -> u8 {
     let code = exit_code::classify(error);
     tracing::info!("退出码 {code}：{}", exit_code::describe(code));
     code as u8
+}
+
+// ---------------------------------------------------------------------------
+// 会话附着状态与 reattach（重连）策略
+// ---------------------------------------------------------------------------
+//
+// 为什么放在 main.rs 而不是 inject.rs：inject.rs 只在 Windows 编译，
+// 而这里的相位/状态机是纯策略、不依赖 Win32。放在平台无关的 crate 根上，
+// Linux CI 也能单测这些分支（真实管道语义仍需 Windows 真机验证）。
+
+/// reattach 等待窗口默认值：DLL 退避上限 30s，留一倍余量。
+pub const DEFAULT_REATTACH_WINDOW_SECS: u64 = 60;
+
+/// 一个进程内最多尝试几轮 reattach，避免“连上又立刻断”时无限空转。
+pub const MAX_REATTACH_ROUNDS: u32 = 3;
+
+/// 宿主与 DLL 的会话可观测状态，供 `/health` 输出。
+///
+/// - `attached`：当前是否有活跃会话（DLL 已连上管道并完成握手前的连接）；
+/// - `reattach_waiting`：是否正处在“等 DLL 重连”的窗口里；
+/// - `reattach_attempts`：本进程启动以来进入等待的轮数（可看出重连在反复失败）。
+#[derive(Debug, Default)]
+pub struct SessionStatus {
+    attached: AtomicBool,
+    reattach_waiting: AtomicBool,
+    reattach_attempts: AtomicU32,
+}
+
+impl SessionStatus {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// 管道已连上（首次注入成功或 reattach 成功）。
+    pub fn mark_attached(&self) {
+        self.attached
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.reattach_waiting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 进入等待 DLL 重连的窗口（轮数 +1）。
+    pub fn mark_reattach_waiting(&self) {
+        self.attached
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.reattach_waiting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.reattach_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 会话结束且不再等待（进程退出/游戏退出）。
+    pub fn mark_detached(&self) {
+        self.attached
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.reattach_waiting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn attached(&self) -> bool {
+        self.attached.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reattach_waiting(&self) -> bool {
+        self.reattach_waiting
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn reattach_attempts(&self) -> u32 {
+        self.reattach_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// 启动时的初始动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialAction {
+    /// 游戏未运行：照旧 spawn_suspended + 注入，行为不变。
+    Inject,
+    /// 游戏已在运行：只建管道等 DLL 主动重连，不注入、不杀进程。
+    Reattach,
+    /// reattach 被禁用（窗口 0）：保持旧行为，退出码 3。
+    BailAlreadyRunning,
+}
+
+/// 决定启动时是正常注入还是进入 reattach 等待。
+///
+/// 旧实现在“游戏已在运行”时直接退出（退出码 3），于是 DLL 侧的重连逻辑
+/// 永远等不到宿主；这里改为进入 reattach。窗口为 0 时保留旧行为作显式退路。
+pub fn initial_action(running: Option<u32>, reattach_window: Duration) -> InitialAction {
+    match running {
+        None => InitialAction::Inject,
+        Some(_) if reattach_window.is_zero() => InitialAction::BailAlreadyRunning,
+        Some(_) => InitialAction::Reattach,
+    }
+}
+
+/// 对端关闭（EOF）后的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerCloseAction {
+    /// 游戏还活着、窗口未耗尽：回到等待 DLL 重连。
+    WaitReconnect,
+    /// 游戏还活着但已无重连机会：退出码 4（须人工重启游戏）。
+    SessionLost,
+    /// 游戏已退出：正常结束，退出码 0。
+    GameExited,
+}
+
+/// 决定会话断开（读到 EOF 或回执写失败）之后是继续等重连还是收尾。
+///
+/// `reattach_window` 是**每轮**窗口（0 表示 reattach 被禁用）——每轮重新计时，
+/// 总等待上限约为 轮数 × 窗口；`attempts_left` 是本进程还能进入等待的轮数，
+/// 防止“连上又立刻断”时无限重试。
+pub fn peer_close_action(
+    game_alive: bool,
+    reattach_window: Duration,
+    attempts_left: u32,
+) -> PeerCloseAction {
+    if !game_alive {
+        PeerCloseAction::GameExited
+    } else if reattach_window.is_zero() || attempts_left == 0 {
+        PeerCloseAction::SessionLost
+    } else {
+        PeerCloseAction::WaitReconnect
+    }
 }
 
 /// 实际的启动与主循环；错误在这里向上抛，由 main 决定退出码。
@@ -107,6 +232,9 @@ fn run() -> Result<()> {
             dir.display()
         );
     }
+    // 会话状态由 inject（Windows）更新、/health 观测；reattach 期间它让
+    // 上游能区分“正在重连”与“彻底失效”。
+    let session = SessionStatus::new();
     let app = Arc::new(server::AppState {
         chat: Arc::clone(&chat),
         token: cfg.token.clone(),
@@ -115,6 +243,7 @@ fn run() -> Result<()> {
         port: cfg.port,
         self_uid: cfg.self_uid,
         packets: Arc::clone(&packets),
+        session: Arc::clone(&session),
     });
 
     let result = runtime.block_on(async move {
@@ -128,9 +257,11 @@ fn run() -> Result<()> {
         #[cfg(windows)]
         let ingest = {
             let cancelled = Arc::clone(&cancelled);
+            // reattach 窗口：0 表示禁用（回到旧行为：游戏已在运行直接退出码 3）。
+            let reattach_window = Duration::from_secs(args.reattach_seconds);
             async move {
                 if !args.auto_launch { return std::future::pending::<Result<()>>().await; }
-                inject::run(chat, connected, Arc::clone(&packets), args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), cancelled).await
+                inject::run(chat, connected, Arc::clone(&packets), Arc::clone(&session), args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), reattach_window, cancelled).await
             }
         };
         #[cfg(not(windows))]
@@ -511,6 +642,12 @@ mod clap_free_args {
         /// 不填时按启动器注册表自动查找（与 Miliastra-Wonderland-Music 一致），
         /// 再退回常见默认安装位置。
         pub game_path: Option<PathBuf>,
+        /// 游戏已在运行（或会话断开）时，每轮等 DLL 重连的窗口秒数。
+        ///
+        /// 默认 60s（DLL 退避上限 30s 的一倍余量）。每轮重新计时，进程内最多
+        /// MAX_REATTACH_ROUNDS 轮，总等待上限约为 轮数 × 该值。
+        /// 0 表示禁用 reattach：游戏已在运行时沿用旧行为，直接以退出码 3 结束。
+        pub reattach_seconds: u64,
     }
 
     impl Args {
@@ -529,6 +666,7 @@ mod clap_free_args {
             let mut capture_dir: Option<PathBuf> = None;
             let mut capture_max_mib = 1024u64;
             let mut game_path: Option<PathBuf> = None;
+            let mut reattach_seconds = super::DEFAULT_REATTACH_WINDOW_SECS;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--config" => {
@@ -574,6 +712,11 @@ mod clap_free_args {
                             args.next().context("--game-path 需要路径参数")?,
                         ));
                     }
+                    "--reattach-seconds" => {
+                        let value = args.next().context("--reattach-seconds 需要数字参数")?;
+                        reattach_seconds =
+                            value.parse().context("--reattach-seconds 必须是整数")?;
+                    }
                     "--version" | "-V" => {
                         println!(
                             "Miliastra-Wonderland-ChatBridge {}",
@@ -583,7 +726,14 @@ mod clap_free_args {
                     }
                     "--help" | "-h" => {
                         println!(
-                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--game-path <exe|dir>] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
+                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--game-path <exe|dir>] [--reattach-seconds <n>] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
+                        );
+                        println!(
+                            "  --reattach-seconds: 每轮等待 DLL 重连的窗口，默认 {}s；0=禁用 reattach。最多 {} 轮，总等待上限约 {}s",
+                            super::DEFAULT_REATTACH_WINDOW_SECS,
+                            super::MAX_REATTACH_ROUNDS,
+                            super::DEFAULT_REATTACH_WINDOW_SECS
+                                * u64::from(super::MAX_REATTACH_ROUNDS),
                         );
                         std::process::exit(0);
                     }
@@ -605,7 +755,107 @@ mod clap_free_args {
                 capture_dir,
                 capture_max_mib,
                 game_path,
+                reattach_seconds,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_already_running_enters_reattach_waiting() {
+        // 旧实现这里直接以退出码 3 退出，导致 DLL 侧重连永远等不到宿主。
+        assert_eq!(
+            initial_action(Some(4321), Duration::from_secs(60)),
+            InitialAction::Reattach
+        );
+        // 窗口可配置：非零即启用。
+        assert_eq!(
+            initial_action(Some(4321), Duration::from_secs(1)),
+            InitialAction::Reattach
+        );
+    }
+
+    #[test]
+    fn first_launch_still_injects() {
+        // 游戏未运行：保持 spawn_suspended + 注入的旧路径。
+        assert_eq!(
+            initial_action(None, Duration::from_secs(60)),
+            InitialAction::Inject
+        );
+    }
+
+    #[test]
+    fn zero_window_keeps_legacy_already_running_bail() {
+        // --reattach-seconds 0 是显式退路：回到旧行为（退出码 3）。
+        assert_eq!(
+            initial_action(Some(4321), Duration::ZERO),
+            InitialAction::BailAlreadyRunning
+        );
+        assert_eq!(exit_code::GAME_ALREADY_RUNNING, 3);
+    }
+
+    #[test]
+    fn eof_with_game_alive_returns_to_reattach_waiting() {
+        // 读管道 EOF 后游戏还在：不再 return 退出，而是回到等待。
+        // 回执（ACK/握手）写失败在 inject 侧同样映射成 PeerClosed，也走这条分支
+        // （Windows-only 测试 ack_write_failure_is_peer_closed_not_process_error 覆盖产生端）。
+        assert_eq!(
+            peer_close_action(true, Duration::from_secs(60), MAX_REATTACH_ROUNDS),
+            PeerCloseAction::WaitReconnect
+        );
+    }
+
+    #[test]
+    fn eof_after_game_exit_ends_cleanly() {
+        assert_eq!(
+            peer_close_action(false, Duration::from_secs(60), MAX_REATTACH_ROUNDS),
+            PeerCloseAction::GameExited
+        );
+        assert_eq!(exit_code::code_of(exit_code::Kind::GameExited), 0);
+    }
+
+    #[test]
+    fn reattach_window_timeout_maps_to_session_lost_game_alive() {
+        // 窗口耗尽（或轮数用完）且游戏还活着：退出码 4，让上游知道须人工重启游戏。
+        assert_eq!(
+            peer_close_action(true, Duration::ZERO, MAX_REATTACH_ROUNDS),
+            PeerCloseAction::SessionLost
+        );
+        assert_eq!(
+            peer_close_action(true, Duration::from_secs(60), 0),
+            PeerCloseAction::SessionLost
+        );
+        assert_eq!(exit_code::SESSION_LOST_GAME_ALIVE, 4);
+        assert_eq!(exit_code::code_of(exit_code::Kind::SessionLostGameAlive), 4);
+    }
+
+    #[test]
+    fn session_status_tracks_attach_and_reattach_rounds() {
+        let status = SessionStatus::new();
+        assert!(!status.attached());
+        assert!(!status.reattach_waiting());
+        assert_eq!(status.reattach_attempts(), 0);
+
+        status.mark_reattach_waiting();
+        assert!(!status.attached());
+        assert!(status.reattach_waiting());
+        assert_eq!(status.reattach_attempts(), 1);
+
+        status.mark_attached();
+        assert!(status.attached());
+        assert!(!status.reattach_waiting());
+        assert_eq!(status.reattach_attempts(), 1);
+
+        // 再次断开进入下一轮等待：轮数累加，便于 /health 看出反复重连。
+        status.mark_reattach_waiting();
+        assert_eq!(status.reattach_attempts(), 2);
+
+        status.mark_detached();
+        assert!(!status.attached());
+        assert!(!status.reattach_waiting());
     }
 }

@@ -9,8 +9,6 @@
 
 use anyhow::Result;
 
-
-
 /// 单包载荷上限（1 MiB）。真实聊天包远小于这个值。
 pub const MAX_PAYLOAD: usize = 1024 * 1024;
 
@@ -150,7 +148,13 @@ mod tests {
         body.extend(3u32.to_le_bytes());
         body.extend([0xAA, 0xBB, 0xCC]);
         let (frame, used) = parse(0x04, &body).unwrap().unwrap();
-        assert_eq!(frame, Frame::Packet { cmd: 2246, payload: vec![0xAA, 0xBB, 0xCC] });
+        assert_eq!(
+            frame,
+            Frame::Packet {
+                cmd: 2246,
+                payload: vec![0xAA, 0xBB, 0xCC]
+            }
+        );
         assert_eq!(used, 9);
     }
 
@@ -193,7 +197,10 @@ mod tests {
 
     #[test]
     fn load_props_reply_is_immediate_terminator() {
-        assert_eq!(reply(&Frame::LoadProps, &sample_rva()), u32::MAX.to_le_bytes());
+        assert_eq!(
+            reply(&Frame::LoadProps, &sample_rva()),
+            u32::MAX.to_le_bytes()
+        );
     }
 
     #[test]
@@ -215,7 +222,10 @@ mod tests {
         let rva = sample_rva();
         for frame in [
             Frame::PlayerProp { kind: 1 },
-            Frame::Packet { cmd: 2246, payload: vec![] },
+            Frame::Packet {
+                cmd: 2246,
+                payload: vec![],
+            },
             Frame::Exit,
         ] {
             assert_eq!(reply(&frame, &rva).len(), 1, "{frame:?} 需要一个 bool");
@@ -248,7 +258,10 @@ mod tests {
                 Frame::LoadProps,
                 Frame::LoadMethodTable,
                 Frame::ResumeMainThread,
-                Frame::Packet { cmd: 2246, payload: vec![1, 2, 3, 4] },
+                Frame::Packet {
+                    cmd: 2246,
+                    payload: vec![1, 2, 3, 4]
+                },
             ],
             "握手 + 首包必须被精确消费"
         );

@@ -30,7 +30,7 @@ impl Fields {
     }
 
     /// 取第一个字节字段。
-    pub fn bytes(&self, field: u32) -> Option<&'_[u8]> {
+    pub fn bytes(&self, field: u32) -> Option<&'_ [u8]> {
         self.values.iter().find_map(|(f, v)| match (f, v) {
             (f, Value::Bytes(b)) if *f == field => Some(b.as_slice()),
             _ => None,
@@ -68,7 +68,9 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
     let mut result = 0u64;
     let mut shift = 0u32;
     loop {
-        let byte = *buf.get(*pos).ok_or_else(|| anyhow::anyhow!("varint 越界"))?;
+        let byte = *buf
+            .get(*pos)
+            .ok_or_else(|| anyhow::anyhow!("varint 越界"))?;
         *pos += 1;
         result |= u64::from(byte & 0x7f) << shift;
         if byte < 0x80 {
@@ -98,22 +100,34 @@ pub fn parse(buf: &[u8]) -> Result<Fields> {
         let value = match tag & 7 {
             0 => Value::Varint(read_varint(buf, &mut pos)?),
             1 => {
-                let end = pos.checked_add(8).ok_or_else(|| anyhow::anyhow!("长度溢出"))?;
-                let slice = buf.get(pos..end).ok_or_else(|| anyhow::anyhow!("fixed64 越界"))?;
+                let end = pos
+                    .checked_add(8)
+                    .ok_or_else(|| anyhow::anyhow!("长度溢出"))?;
+                let slice = buf
+                    .get(pos..end)
+                    .ok_or_else(|| anyhow::anyhow!("fixed64 越界"))?;
                 pos = end;
                 Value::Fixed64(u64::from_le_bytes(slice.try_into().expect("8 字节")))
             }
             2 => {
                 let len = usize::try_from(read_varint(buf, &mut pos)?)
                     .map_err(|_| anyhow::anyhow!("长度过大"))?;
-                let end = pos.checked_add(len).ok_or_else(|| anyhow::anyhow!("长度溢出"))?;
-                let slice = buf.get(pos..end).ok_or_else(|| anyhow::anyhow!("bytes 越界"))?;
+                let end = pos
+                    .checked_add(len)
+                    .ok_or_else(|| anyhow::anyhow!("长度溢出"))?;
+                let slice = buf
+                    .get(pos..end)
+                    .ok_or_else(|| anyhow::anyhow!("bytes 越界"))?;
                 pos = end;
                 Value::Bytes(slice.to_vec())
             }
             5 => {
-                let end = pos.checked_add(4).ok_or_else(|| anyhow::anyhow!("长度溢出"))?;
-                let slice = buf.get(pos..end).ok_or_else(|| anyhow::anyhow!("fixed32 越界"))?;
+                let end = pos
+                    .checked_add(4)
+                    .ok_or_else(|| anyhow::anyhow!("长度溢出"))?;
+                let slice = buf
+                    .get(pos..end)
+                    .ok_or_else(|| anyhow::anyhow!("fixed32 越界"))?;
                 pos = end;
                 Value::Fixed32(u32::from_le_bytes(slice.try_into().expect("4 字节")))
             }

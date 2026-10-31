@@ -124,13 +124,16 @@ internal static unsafe class Application {
             if (TryGetData(val, (int) packetLength, out var data, out unzipBuf)) {
                 // 只复制并入队，立即返回：这一步绝不能碰管道。
                 if (required) {
-                    PacketOutbox.Enqueue(cmdId, data.ToArray());
+                    // 容量检查、满队列 Dropped 计数与载荷拷贝都在 Enqueue 内部；
+                    // 队列满/终态时游戏网络线程不会做无意义的 ToArray。
+                    PacketOutbox.Enqueue(cmdId, data);
                 }
                 if (allPackets && !DebugOutbox.Disabled) {
                     // debug 通道只入队/计数，不做 IO；写失败由后台线程单独停用，不影响聊天。
-                    // 停用后不再复制（ToArray 在游戏网络线程上，白复制只增加 GC 压力）。
+                    // 载荷拷贝移进 Enqueue：Disable/容量/字节检查都在拷贝之前，
+                    // 停用或满队列时游戏网络线程不再做无意义的 ToArray。
                     // TryGetData 已按 MaxPacketDataLength(1 MiB) 过滤，debug 包与聊天包同一上限。
-                    DebugOutbox.Enqueue(cmdId, data.ToArray());
+                    DebugOutbox.Enqueue(cmdId, data);
                 }
             }
         } catch (Exception ex) when (

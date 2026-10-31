@@ -2,6 +2,8 @@
 
 提供本地消息查询与实时订阅。HTTP 基础地址为 `http://127.0.0.1:18889`，端口以启动配置为准；响应使用 JSON。
 
+进程退出码、reattach 行为与上游启动器的决策契约见 README 的「生命周期：reattach 与退出码」；本文只描述 HTTP / WebSocket 接口。
+
 ## 鉴权
 
 HTTP 请求及 WebSocket 握手使用请求头：
@@ -39,7 +41,7 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 
 ### GET /health
 
-鉴权通过后返回 `200`，数据源是否可用由 `gameConnected` 表示。
+鉴权通过后返回 `200`，数据源是否可用由 `gameConnected` 表示；会话是否接入、是否正在等待 DLL 重连由新增的 `attached` / `reattachWaiting` / `reattachAttempts` 表示。
 
 ```json
 {
@@ -47,6 +49,9 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
   "version": "0.1.0",
   "uptimeSec": 3600,
   "gameConnected": true,
+  "attached": true,
+  "reattachWaiting": false,
+  "reattachAttempts": 0,
   "currentHall": { "id": 1000000000000000001, "type": 16 },
   "lastMessageId": 42,
   "subscribers": 1,
@@ -67,6 +72,14 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 ```
 
 `currentHall` 未知时为 `null`，其中 `type` 未知时也可为 `null`；`subscribers` 为实时订阅数。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `attached` | bool | 当前是否有活跃会话：首次注入成功或 reattach 成功连上 DLL |
+| `reattachWaiting` | bool | 是否正在等待 DLL 主动重连（reattach 窗口） |
+| `reattachAttempts` | uint32 | 本进程启动以来进入等待的轮数，累计值；反复失败会持续增大 |
+
+`attached` 是会话级状态；`gameConnected` 是既有兼容字段。reattach 等待期间两者都为 `false`，此时 `/messages` 与 `/names` 返回 `503 game_not_connected`，`/stream` 仍可连接（hello 正常）但不会有新消息。等待结束后客户端应重新查看 `/health`，再按游标补拉 `/messages`。默认 reattach 最多 3 轮窗口，因此 `reattachAttempts` 正常最多约为 3；数值持续增大说明重连在反复失败。
 
 `diag.ackP99Us` 持续接近 50000 微秒，说明收包循环在等 50ms 空闲轮询；`lastMessageAgeMs` 是"距最近一条消息多久"，可用来区分"大厅没人说话"与"链路卡住"。
 
@@ -196,8 +209,8 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 `applied` / `dllControl` 语义：
 
 - `dllControl: true` + `applied: true`：控制管道已连接，DLL 已切换。
-- `dllControl: false` + `applied: false`：DLL 未连接或为旧 DLL（没有控制管道）。宿主仍会记录新模式（后续 `GET /debug/packets` 的 `mode` 已是新值），但 DLL 行为不会改变。
-- 宿主只接受一次控制/数据管道连接：DLL 断开后宿主记录的模式保留，但不会自动重连或重新下发；需要重启宿主与 DLL 才能恢复 debug 能力。
+- `dllControl: false` + `applied: false`：DLL 未连接、为旧 DLL（没有控制管道），或宿主重启后控制通道尚未恢复。宿主仍会记录新模式（后续 `GET /debug/packets` 的 `mode` 已是新值），但 DLL 行为不会改变。
+- **控制管道与 debug 数据通道不参与重连**：DLL 只在初始化时连接它们一次。宿主重启后即使聊天主通道通过 reattach 恢复，DLL 也不会重新连接控制/debug 管道，`dllControl` 保持 `false`，`applied` 只能是 `false`；要恢复全包模式必须**重启游戏**（重新注入 DLL）。聊天主通道不受影响。
 
 模式是运行期状态，**不持久化**：进程重启后回到 `chat`，需要重新调用本接口。
 

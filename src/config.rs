@@ -109,7 +109,10 @@ mod tests {
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("Miliastra-Wonderland-ChatBridge-cfg-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "Miliastra-Wonderland-ChatBridge-cfg-{tag}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
     }
@@ -145,7 +148,12 @@ mod tests {
 
     #[test]
     fn missing_file_is_an_error() {
-        let err = load(Path::new("/definitely/not/here.yaml"), 1, &Overrides::default()).expect_err("文件不存在");
+        let err = load(
+            Path::new("/definitely/not/here.yaml"),
+            1,
+            &Overrides::default(),
+        )
+        .expect_err("文件不存在");
         assert!(err.to_string().contains("读取配置文件失败"), "{err}");
     }
 }

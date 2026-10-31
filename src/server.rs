@@ -32,6 +32,9 @@ pub struct AppState {
     pub self_uid: u32,
     /// 调试全包模式开关与抓包状态，由 main 构造；HTTP 侧只做读写。
     pub packets: Arc<PacketControl>,
+    /// 会话附着状态（attached / reattach 等待与轮数），由 main 构造、
+    /// inject 更新；/health 只读。
+    pub session: Arc<crate::SessionStatus>,
 }
 
 /// 组装路由。
@@ -156,6 +159,11 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         "version": env!("CARGO_PKG_VERSION"),
         "uptimeSec": state.started.elapsed().as_secs(),
         "gameConnected": state.connected.load(std::sync::atomic::Ordering::Relaxed),
+        // reattach 观测：attached=当前有活跃会话；reattachWaiting=正在等 DLL
+        // 重连；reattachAttempts=本进程进入等待的轮数（反复失败会持续增大）。
+        "attached": state.session.attached(),
+        "reattachWaiting": state.session.reattach_waiting(),
+        "reattachAttempts": state.session.reattach_attempts(),
         // type 为 0 表示还没观测到（7154 人数包只给 hall_id）。
         // 输出 null 而不是 0，避免调用方把 0 当成真实大厅类型。
         "currentHall": hall.map(|(id, ty)| {
@@ -562,6 +570,7 @@ mod tests {
             self_uid: 999,
             // 单测里没有 DLL：默认 chat，控制管道未连接。
             packets: PacketControl::new(PacketMode::Chat, None),
+            session: crate::SessionStatus::new(),
         })
     }
 
@@ -612,6 +621,48 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(value["events"].is_array());
+    }
+
+    async fn get_health(state: Arc<AppState>) -> serde_json::Value {
+        let request = axum::http::Request::builder()
+            .uri("/health")
+            .header("x-miliastra-token", "secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    #[tokio::test]
+    async fn health_reports_attach_and_reattach_state() {
+        let state = app_state(false);
+
+        // 初始：未接入、未等待、0 轮。
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["attached"], false);
+        assert_eq!(value["reattachWaiting"], false);
+        assert_eq!(value["reattachAttempts"], 0);
+
+        // 进入 reattach 等待：等待中、轮数 +1。
+        state.session.mark_reattach_waiting();
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["attached"], false);
+        assert_eq!(value["reattachWaiting"], true);
+        assert_eq!(value["reattachAttempts"], 1);
+
+        // DLL 重连成功：已接入、不再等待，轮数保留。
+        state.session.mark_attached();
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["attached"], true);
+        assert_eq!(value["reattachWaiting"], false);
+        assert_eq!(value["reattachAttempts"], 1);
+
+        // 再次断开：第二轮等待，轮数累加，上游可据此看出反复重连。
+        state.session.mark_reattach_waiting();
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["reattachWaiting"], true);
+        assert_eq!(value["reattachAttempts"], 2);
     }
 
     /// 构造 /debug/packets 请求：GET 无 body，POST 可带 JSON。

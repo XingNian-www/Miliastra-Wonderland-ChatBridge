@@ -61,7 +61,9 @@ pub enum ServerEvent {
         #[serde(rename = "lastMessageId")]
         last_message_id: u64,
     },
-    Message { message: ChatMessage },
+    Message {
+        message: ChatMessage,
+    },
     #[serde(rename_all = "camelCase")]
     HallChanged {
         hall_id: u64,

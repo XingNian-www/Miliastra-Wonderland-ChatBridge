@@ -9,6 +9,17 @@
         <TargetFramework>net9.0-windows</TargetFramework>
     </PropertyGroup>
 
+    <!-- 生产构建也保留 DLL 侧关键日志（连接/断线/重连/停用/握手失败）。
+         历史上没有定义 EnableLogging，而 Log.cs 的 WriteLog 带 [Conditional("EnableLogging")]，
+         导致 Log.* 调用与日志字符串在 Release/AOT 构建里被整体剔除——线上排障只能看到宿主日志。
+         注意：EnableConsoleOutput 是独立符号、生产**不定义**：日志代码保留（字符串在产物里、
+         WriteLog 会被调用），但 UseConsoleOutput/ResetConsole 的调用仍被剔除，注入不会给
+         游戏进程弹控制台窗口。EnableLogging 由下方 VerifyDllLoggingEnabled 护栏强制存在，
+         EnableConsoleOutput 不强制。 -->
+    <PropertyGroup>
+        <DefineConstants>$(DefineConstants);EnableLogging</DefineConstants>
+    </PropertyGroup>
+
     <PropertyGroup>
         <PublishAot>true</PublishAot>
         <PlatformTarget>x64</PlatformTarget>
@@ -25,6 +36,13 @@
         <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
         <Description>Genshin chat sniffer DLL for Miliastra-Wonderland-ChatBridge</Description>
     </PropertyGroup>
+
+    <!-- 回归护栏：两份独立审核都发现过 EnableLogging 未被定义导致线上日志全被剔除。
+         任何人删掉上面的 DefineConstants 时，让构建直接失败而不是静默失去可观测性。 -->
+    <Target Name="VerifyDllLoggingEnabled" BeforeTargets="CoreCompile"
+            Condition="!$(DefineConstants.Contains('EnableLogging'))">
+        <Error Text="EnableLogging is required for DLL-side incident logs (see DefineConstants in native/MiliastraWonderlandChatBridge.Native.csproj)." />
+    </Target>
 
     <ItemGroup>
         <Compile Remove="tests/**/*.cs" />

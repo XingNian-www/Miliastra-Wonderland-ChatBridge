@@ -93,7 +93,7 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 ```json
 {
   "uptimeMs": 3600000,
-  "build": { "version": "0.1.3", "sha": "b9e58a1", "builtAt": "2026-10-29T04:00:00Z" },
+  "build": { "version": "0.2.0", "sha": "2ce1c8c", "builtAt": "2026-11-01T05:40:00Z" },
   "pipe": {
     "dllConnected": true,
     "framesTotal": 120000,

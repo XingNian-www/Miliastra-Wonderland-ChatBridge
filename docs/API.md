@@ -58,6 +58,20 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
   "currentHall": { "id": 1000000000000000001, "type": 16 },
   "lastMessageId": 42,
   "subscribers": 1,
+  "dll": {
+    "alive": true,
+    "heartbeatAgeMs": 812,
+    "state": "forwarding",
+    "forwarding": true,
+    "reconnecting": false,
+    "debugDisabled": false,
+    "abandonedLimitReached": false,
+    "timeoutCount": 0,
+    "abandonedTasks": 0,
+    "seq": 1234,
+    "lostFrames": 0,
+    "parseErrors": 0
+  },
   "diag": {
     "dllConnected": true,
     "framesPerSec": 21.4,
@@ -81,6 +95,40 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 | `attached` | bool | 当前是否有活跃会话：首次注入成功或 reattach 成功连上 DLL |
 | `reattachWaiting` | bool | 是否正在等待 DLL 主动重连（reattach 窗口） |
 | `reattachAttempts` | uint32 | 本进程启动以来进入等待的轮数，累计值；反复失败会持续增大 |
+
+#### `dll` 对象：DLL 健康心跳
+
+宿主与 DLL 之间除了聊天/调试/控制三条管道，还有一条**健康上报管道**（`MiliastraWonderlandChatBridgeHealth`，DLL→宿主，单向、无 ACK）。DLL 每 1 秒发一帧 28 字节心跳，让宿主能区分「DLL 正常但游戏安静」与「DLL 已出问题」——**只看有没有数据是分不出来的**。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `alive` | bool | 最近 3 秒内收到过心跳 |
+| `heartbeatAgeMs` | uint64 或 null | 距上次心跳的毫秒数；从未收到为 `null` |
+| `state` | string | `forwarding` / `disabled` / `reconnecting` / `silent` / `unknown` |
+| `forwarding` | bool | DLL 的聊天发送队列是否仍在工作 |
+| `reconnecting` | bool | DLL 是否正在重连宿主 |
+| `debugDisabled` | bool | DLL 的 debug 全包队列是否已停用 |
+| `abandonedLimitReached` | bool | DLL 放弃的 IO 任务是否达到上限（自愈已停） |
+| `timeoutCount` | uint64 | DLL 累计发送超时次数 |
+| `abandonedTasks` | uint64 | DLL 当前被放弃的 IO 任务数 |
+| `seq` | uint32 | 最近一帧心跳的序号，判丢帧用（回绕语义） |
+| `lostFrames` | uint64 | 按 `seq` 缺口累计的丢帧数（wrapping 语义）。超过 600 帧的跳变按对端重连处理，不计入 |
+| `parseErrors` | uint64 | 心跳帧解析失败次数（通常是 DLL 与宿主协议版本不一致） |
+
+`state` 含义：
+
+| 值 | 含义 |
+|---|---|
+| `forwarding` | 心跳正常且 DLL 正在转发聊天 |
+| `disabled` | **DLL 活着但已停止转发**——这是最关键的状态，旧版本完全看不到 |
+| `reconnecting` | DLL 正在重连宿主 |
+| `silent` | 超过 5 秒没有心跳：DLL 可能已被卸载、游戏卡死 |
+| `unknown` | 从未收到心跳。旧 DLL 不连这条管道时恒为此值，**不是错误** |
+
+3~5 秒之间是宽限带：`alive` 已为 `false`，但 `state` 仍显示最后一次上报的状态，用来容忍 GC 停顿与线程调度抖动。
+
+**注意**：健康管道是可选增强，创建失败只记 warn，不影响聊天。旧 DLL 不会连接它，`state` 永远是 `unknown`，宿主只记一次 info，不刷屏。
+
 
 `attached` 是会话级状态；`gameConnected` 是既有兼容字段。reattach 等待期间两者都为 `false`，此时 `/messages` 与 `/names` 返回 `503 game_not_connected`，`/stream` 仍可连接（hello 正常）但不会有新消息。等待结束后客户端应重新查看 `/health`，再按游标补拉 `/messages`。默认 reattach 最多 3 轮窗口，因此 `reattachAttempts` 正常最多约为 3；数值持续增大说明重连在反复失败。
 

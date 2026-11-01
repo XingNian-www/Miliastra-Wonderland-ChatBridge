@@ -35,6 +35,9 @@ pub struct AppState {
     /// 会话附着状态（attached / reattach 等待与轮数），由 main 构造、
     /// inject 更新；/health 只读。
     pub session: Arc<crate::SessionStatus>,
+    /// DLL 健康心跳状态：inject 的健康管道读线程更新，/health 只读。
+    /// 旧 DLL 不连健康管道时 state 会一直是 unknown（这不是错误）。
+    pub dll_health: Arc<crate::dll_health::HealthState>,
     /// 进程启动标识：main 构造时生成一次，生命周期内不变。
     ///
     /// 消息 id 每次进程重启都从 1 开始；上游用 bootId 区分「同一进程内
@@ -189,6 +192,9 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         "attached": state.session.attached(),
         "reattachWaiting": state.session.reattach_waiting(),
         "reattachAttempts": state.session.reattach_attempts(),
+        // DLL 健康心跳（独立管道，每 1s 一帧）：unknown=旧 DLL/尚未收到；
+        // alive/heartbeatAgeMs/state 按阈值现算；silent=5s 无心跳。
+        "dll": state.dll_health.snapshot_json(),
         // type 为 0 表示还没观测到（7154 人数包只给 hall_id）。
         // 输出 null 而不是 0，避免调用方把 0 当成真实大厅类型。
         "currentHall": hall.map(|(id, ty)| {
@@ -602,6 +608,7 @@ mod tests {
             // 单测里没有 DLL：默认 chat，控制管道未连接。
             packets: PacketControl::new(PacketMode::Chat, None),
             session: crate::SessionStatus::new(),
+            dll_health: crate::dll_health::HealthState::with_defaults(),
             boot_id: 12345,
         })
     }
@@ -695,6 +702,74 @@ mod tests {
         let value = get_health(Arc::clone(&state)).await;
         assert_eq!(value["reattachWaiting"], true);
         assert_eq!(value["reattachAttempts"], 2);
+    }
+
+    #[tokio::test]
+    async fn health_reports_dll_unknown_without_heartbeat() {
+        let state = app_state(false);
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["dll"]["state"], "unknown");
+        assert_eq!(value["dll"]["alive"], false);
+        assert!(value["dll"]["heartbeatAgeMs"].is_null());
+        assert_eq!(value["dll"]["forwarding"], false);
+        assert_eq!(value["dll"]["reconnecting"], false);
+        assert_eq!(value["dll"]["debugDisabled"], false);
+        assert_eq!(value["dll"]["abandonedLimitReached"], false);
+        assert_eq!(value["dll"]["timeoutCount"], 0);
+        assert_eq!(value["dll"]["abandonedTasks"], 0);
+        assert_eq!(value["dll"]["seq"], 0);
+        assert_eq!(value["dll"]["parseErrors"], 0);
+    }
+
+    #[tokio::test]
+    async fn health_reports_dll_heartbeat_forwarding() {
+        let state = app_state(false);
+        state
+            .dll_health
+            .note_heartbeat(crate::health::HealthFrame::new(77, 0, 4, 1), Instant::now());
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["dll"]["state"], "forwarding");
+        assert_eq!(value["dll"]["alive"], true);
+        assert!(value["dll"]["heartbeatAgeMs"].is_number());
+        assert_eq!(value["dll"]["forwarding"], true);
+        assert_eq!(value["dll"]["reconnecting"], false);
+        assert_eq!(value["dll"]["seq"], 77);
+        assert_eq!(value["dll"]["timeoutCount"], 4);
+        assert_eq!(value["dll"]["abandonedTasks"], 1);
+    }
+
+    #[tokio::test]
+    async fn health_reports_dll_silent_and_parse_errors() {
+        let state = app_state(false);
+        // 最近一次心跳是 6s 前：默认 silent=5s -> silent；flags 仍可读。
+        let frame =
+            crate::health::HealthFrame::new(9, crate::health::FLAG_PACKET_OUTBOX_DISABLED, 2, 0);
+        state
+            .dll_health
+            .note_heartbeat(frame, Instant::now() - Duration::from_secs(6));
+        state.dll_health.note_parse_error();
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["dll"]["state"], "silent");
+        assert_eq!(value["dll"]["alive"], false);
+        assert_eq!(value["dll"]["forwarding"], false);
+        assert_eq!(value["dll"]["parseErrors"], 1);
+        assert!(value["dll"]["heartbeatAgeMs"].as_u64().unwrap() >= 6000);
+    }
+
+    #[tokio::test]
+    async fn health_dll_resets_to_unknown_after_reattach() {
+        let state = app_state(false);
+        state
+            .dll_health
+            .note_heartbeat(crate::health::HealthFrame::new(1, 0, 0, 0), Instant::now());
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["dll"]["state"], "forwarding");
+        // AuxPipes 在 reattach 重建时调用 reset_session：回到 unknown 直到首个心跳。
+        state.dll_health.reset_session();
+        let value = get_health(Arc::clone(&state)).await;
+        assert_eq!(value["dll"]["state"], "unknown");
+        assert!(value["dll"]["heartbeatAgeMs"].is_null());
+        assert_eq!(value["dll"]["alive"], false);
     }
 
     #[tokio::test]

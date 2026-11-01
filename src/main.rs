@@ -9,7 +9,10 @@
 
 mod config;
 mod diag;
+mod dll_health;
 mod extract;
+mod health;
+mod health_vector;
 mod metadata;
 mod model;
 mod packet_control;
@@ -235,6 +238,10 @@ fn run() -> Result<()> {
     // 会话状态由 inject（Windows）更新、/health 观测；reattach 期间它让
     // 上游能区分“正在重连”与“彻底失效”。
     let session = SessionStatus::new();
+    // DLL 健康心跳状态：inject 的 mwc-health-pipe 线程更新，/health 只读。
+    // 看门狗线程独立于 HTTP：没有请求时也会在 5s 无心跳后记 ERROR。
+    let dll_health = dll_health::HealthState::with_defaults();
+    dll_health.start_watchdog();
     // 进程启动标识：同一进程内不变；WS hello 与 /health 都读它。上游靠它
     // 检测宿主重启（消息序号归零），从而重置自己的游标/水位（见 docs/API.md）。
     let boot_id = server::generate_boot_id();
@@ -247,6 +254,7 @@ fn run() -> Result<()> {
         self_uid: cfg.self_uid,
         packets: Arc::clone(&packets),
         session: Arc::clone(&session),
+        dll_health: Arc::clone(&dll_health),
         boot_id,
     });
 
@@ -263,9 +271,10 @@ fn run() -> Result<()> {
             let cancelled = Arc::clone(&cancelled);
             // reattach 窗口：0 表示禁用（回到旧行为：游戏已在运行直接退出码 3）。
             let reattach_window = Duration::from_secs(args.reattach_seconds);
+            let dll_health = Arc::clone(&dll_health);
             async move {
                 if !args.auto_launch { return std::future::pending::<Result<()>>().await; }
-                inject::run(chat, connected, Arc::clone(&packets), Arc::clone(&session), args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), reattach_window, cancelled).await
+                inject::run(chat, connected, Arc::clone(&packets), Arc::clone(&session), dll_health, args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), reattach_window, cancelled).await
             }
         };
         #[cfg(not(windows))]

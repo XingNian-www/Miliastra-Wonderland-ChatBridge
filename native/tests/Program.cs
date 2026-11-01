@@ -38,7 +38,7 @@ internal static class Program {
                          "queue", "ack", "disconnect", "timeout", "sendstuck", "sendwriteblock",
                          "reconnectbackoff", "reconnecthandshake", "reconnectpassthrough", "reconnectexhaust",
                          "modereconnect", "controlstale", "abandonedlimit", "handshakewindow", "handshakegap",
-                         "debugrecovery", "abortinit",
+                         "debugrecovery", "abortinit", "healthreport",
                          "debugcapacity", "debugbytes", "debugwritetimeout",
                      })
                 RunIsolated(scenario);
@@ -61,6 +61,7 @@ internal static class Program {
                 case "handshakewindow": HandshakeWindowChecks(); break;
                 case "debugrecovery": DebugRecoveryChecks(); break;
                 case "abortinit": AbortInitializationChecks(); break;
+                case "healthreport": HealthReportChecks(); break;
                 case "debugcapacity": DebugCapacityChecks(); break;
                 case "debugbytes": DebugByteCapChecks(); break;
                 case "debugwritetimeout": DebugWriteTimeoutChecks(); break;
@@ -994,6 +995,155 @@ internal static class Program {
     }
 
     /// <summary>
+    /// task-31 回归：健康上报通道（第四条管道）。
+    /// 覆盖连接退避/恢复、正常帧格式与 flags、PacketOutbox.Disable 后继续心跳且 bit0 置位、
+    /// seq 递增，以及 debug/Reconnecting/abandoned-limit 三个状态位。
+    /// </summary>
+    private static void HealthReportChecks() {
+        Check(HealthReporter.FrameSize == 28, "health frame is fixed 28 bytes");
+        Check(HealthReporter.FrameMagic == 0x4D57 && HealthReporter.FrameVersion == 1 &&
+              HealthReporter.FrameKind == 0x01, "health frame has the agreed magic/version/kind");
+        // 跨语言契约：解析 Rust src/health_vector.rs 里钉死的同一组字节。
+        // 只测自己的常量无法发现「两侧各改各的」——必须用对方实际产出的字节断言。
+        var golden = new byte[] {
+            0x57, 0x4D, 0x01, 0x01,
+            0x07, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00,
+            0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        // 发射端也必须产出同一组字节：只测解码器抓不到「写入字节序/偏移改坏」。
+        var encoded = HealthReporter.EncodeFrameFields(7, 0b11u, 42, 3);
+        Check(encoded.Length == golden.Length && encoded.AsSpan().SequenceEqual(golden),
+            "encoder reproduces the cross-language golden vector byte for byte");
+
+        Check(golden.Length == HealthReporter.FrameSize, "golden vector is exactly one frame");
+        var gf = ParseHealthFrame(golden, 0);
+        Check(gf.Magic == 0x4D57 && gf.Version == 1 && gf.Kind == 0x01,
+            "golden vector carries the agreed magic/version/kind");
+        Check(gf.Seq == 7 && gf.Flags == 0b11 && gf.TimeoutCount == 42 && gf.AbandonedTasks == 3,
+            "golden vector decodes to expected seq/flags/counters");
+        Check((gf.Flags & HealthReporter.FlagChatDisabled) != 0 && (gf.Flags & HealthReporter.FlagReconnecting) != 0,
+            "golden vector sets chat-disabled and reconnecting bits");
+        Check(HealthReporter.DefaultHeartbeatIntervalMs == 1000, "health heartbeat defaults to 1s");
+        Check(HealthReporter.MinHeartbeatIntervalMs > 0, "health heartbeat has a positive lower bound");
+
+        HealthReporter.HeartbeatIntervalMs = 10;
+        HealthReporter.ReconnectInitialDelayMs = 10;
+        HealthReporter.ReconnectMaxDelayMs = 20;
+
+        // 让主通道处于 Connected，flags bit1 初始为 0；后续再主动进入 Reconnecting。
+        using var ack = new AckStream(block: false);
+        SetPipe(Stream.Null, ack);
+
+        var hostUp = 0;
+        var sink = new HealthSink();
+        HealthReporter.ConnectStreamForTest = () => {
+            if (Volatile.Read(ref hostUp) == 0) {
+                throw new IOException("regression: no health host");
+            }
+            return sink;
+        };
+        HealthReporter.Start();
+
+        Check(SpinWait.SpinUntil(() => HealthReporter.ReconnectAttempts >= 2, WaitMs),
+            "health connection failures are retried with backoff");
+        Check(HealthReporter.ConnectCount == 0, "health reporter has not connected while the host is absent");
+        Check(HealthReporter.FramesSent == 0, "health reporter sends no frames before connecting");
+
+        Volatile.Write(ref hostUp, 1);
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent >= 1, WaitMs),
+            "health reporter recovers and sends once the host appears");
+        Check(HealthReporter.ConnectCount >= 1, "health connect count increases after recovery");
+
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent >= 3, WaitMs),
+            "health reporter sends a continuous stream of heartbeats");
+        var frames = sink.Snapshot();
+        Check(frames.Length >= HealthReporter.FrameSize * 3, "health sink contains complete frames");
+        var f0 = ParseHealthFrame(frames, 0);
+        var f1 = ParseHealthFrame(frames, HealthReporter.FrameSize);
+        var f2 = ParseHealthFrame(frames, HealthReporter.FrameSize * 2);
+        Check(f0.Magic == 0x4D57 && f0.Version == 1 && f0.Kind == 0x01,
+            "normal health frame carries magic/version/kind");
+        Check(f0.Flags == 0, "normal health frame has no status flags");
+        Check(f0.TimeoutCount == 0 && f0.AbandonedTasks == 0,
+            "normal health frame reports zero counters");
+        Check(f0.Seq == 1, "first health frame starts at seq 1");
+        Check(f1.Seq == unchecked(f0.Seq + 1) && f2.Seq == unchecked(f1.Seq + 1),
+            "health frame sequence numbers increase by one");
+
+        // bit2：debug 通道停用。
+        var before = HealthReporter.FramesSent;
+        DebugOutbox.Disable("health flags regression");
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent > before, WaitMs),
+            "heartbeat continues after debug disable");
+        Check((LatestHealthFrame(sink).Flags & HealthReporter.FlagDebugDisabled) != 0,
+            "debug disabled sets health flag bit2");
+
+        // bit1：主通道 Reconnecting。
+        Goshujin.ConnectStreamForTest = () => throw new IOException("regression: chat host absent");
+        Check(Goshujin.RequestReconnect("health flags regression"),
+            "main pipe can enter reconnecting for the flags check");
+        Check(SpinWait.SpinUntil(() => Goshujin.State == Goshujin.ConnectionState.Reconnecting, WaitMs),
+            "main pipe is reconnecting");
+        before = HealthReporter.FramesSent;
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent > before, WaitMs),
+            "heartbeat continues while chat reconnects");
+        Check((LatestHealthFrame(sink).Flags & HealthReporter.FlagReconnecting) != 0,
+            "reconnecting state sets health flag bit1");
+
+        // bit3：聊天放弃任务达到上限（不触发 RequestReconnect，仅观察 flags）。
+        var blockers = new List<TaskCompletionSource<object?>>();
+        for (var i = 0; i < Goshujin.MaxAbandonedIoTaskCount; i++) {
+            var blocker = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            blockers.Add(blocker);
+            Goshujin.TrackAbandonedIoTask(blocker.Task);
+        }
+        Check(Goshujin.AbandonedIoTaskLimitReached, "chat abandoned IO limit is reached");
+        before = HealthReporter.FramesSent;
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent > before, WaitMs),
+            "heartbeat continues at the abandoned cap");
+        var fCap = LatestHealthFrame(sink);
+        Check((fCap.Flags & HealthReporter.FlagAbandonedLimit) != 0,
+            "abandoned IO limit sets health flag bit3");
+        Check(fCap.AbandonedTasks == (ulong) Goshujin.MaxAbandonedIoTaskCount,
+            "health frame carries the chat abandoned task count");
+
+        // bit0 + 独立性：PacketOutbox.Disable 后心跳必须继续。
+        before = HealthReporter.FramesSent;
+        PacketOutbox.Disable("health independence regression");
+        Check(PacketOutbox.Disabled, "chat outbox is disabled for the independence check");
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent > before, WaitMs),
+            "heartbeat continues after PacketOutbox.Disable (independent channel)");
+        var fDisabled = LatestHealthFrame(sink);
+        Check((fDisabled.Flags & HealthReporter.FlagChatDisabled) != 0,
+            "PacketOutbox.Disabled sets health flag bit0");
+        Check((fDisabled.Flags & HealthReporter.FlagDebugDisabled) != 0,
+            "debug flag remains visible after chat disable");
+        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent >= before + 3, WaitMs),
+            "heartbeats keep flowing for multiple intervals after chat disable");
+        _ = blockers;
+    }
+
+    private readonly record struct HealthFrame(ushort Magic, byte Version, byte Kind, uint Seq, uint Flags,
+        ulong TimeoutCount, ulong AbandonedTasks);
+
+    private static HealthFrame ParseHealthFrame(byte[] bytes, int offset) => new(
+        BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset)),
+        bytes[offset + 2],
+        bytes[offset + 3],
+        BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset + 4)),
+        BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset + 8)),
+        BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset + 12)),
+        BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset + 20)));
+
+    private static HealthFrame LatestHealthFrame(HealthSink sink) {
+        var bytes = sink.Snapshot();
+        var frameCount = bytes.Length / HealthReporter.FrameSize;
+        return ParseHealthFrame(bytes, (frameCount - 1) * HealthReporter.FrameSize);
+    }
+
+    /// <summary>
     /// 把方法表标记为"已解析"（哨兵值）。重连握手据此走幂等分支、不触碰 Native.RVAToVA，
     /// 从而让这组回归在非 Windows 开发机上也能跑（测试不调用任何 Windows API）。
     /// </summary>
@@ -1050,6 +1200,41 @@ internal static class Program {
     private static unsafe byte Decompress(void* tcp, void* shared, void* source, uint sourceSize, void* target, uint size) {
         new byte[] {41, 42, 43}.CopyTo(new Span<byte>(target, (int) size));
         return _decompressResult ? (byte) 1 : (byte) 0;
+    }
+
+    /// <summary>健康上报的线程安全内存管道：收集所有心跳帧供断言解析。</summary>
+    private sealed class HealthSink : Stream {
+        private readonly object _gate = new();
+        private readonly MemoryStream _buffer = new();
+
+        public byte[] Snapshot() {
+            lock (_gate) {
+                return _buffer.ToArray();
+            }
+        }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) {
+            lock (_gate) {
+                _buffer.Write(buffer, offset, count);
+            }
+        }
+        public override void Write(ReadOnlySpan<byte> buffer) {
+            lock (_gate) {
+                _buffer.Write(buffer);
+            }
+        }
     }
 
     private sealed class AckStream(bool block) : Stream {

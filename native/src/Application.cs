@@ -41,6 +41,13 @@ internal static unsafe class Application {
             } catch (Exception ex) {
                 Log.Warn($"debug/control 通道启动失败，保持 chat 模式: {ex.Message}");
             }
+            // 健康上报单独 try：它独立于聊天/debug，即使上面两条增强通道启动失败也必须启动，
+            // 这样宿主在 DLL 停止转发（PacketOutbox.Disable）后仍能收到「我还活着但停了」。
+            try {
+                HealthReporter.Start();
+            } catch (Exception ex) {
+                Log.Warn($"健康上报通道启动失败: {ex.Message}");
+            }
             Goshujin.LoadTasks();
             Goshujin.LoadProps();
             Goshujin.LoadMethodTable();

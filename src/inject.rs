@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::dll_health::HealthState;
 use crate::extract;
+use crate::health;
 use crate::packet_control::{CONTROL_PIPE_NAME, DEBUG_PIPE_NAME, PacketControl};
 use crate::state::ChatState;
 use crate::{InitialAction, MAX_REATTACH_ROUNDS, PeerCloseAction, SessionStatus};
@@ -62,6 +64,7 @@ pub async fn run(
     connected: Arc<AtomicBool>,
     packets: Arc<PacketControl>,
     session: Arc<SessionStatus>,
+    health: Arc<HealthState>,
     auto_launch: bool,
     spawn_only: bool,
     lib_only: bool,
@@ -75,6 +78,7 @@ pub async fn run(
             &connected,
             &packets,
             &session,
+            &health,
             auto_launch,
             spawn_only,
             lib_only,
@@ -134,6 +138,7 @@ fn supervise(
     connected: &AtomicBool,
     packets: &Arc<PacketControl>,
     session: &SessionStatus,
+    health: &Arc<HealthState>,
     auto_launch: bool,
     spawn_only: bool,
     lib_only: bool,
@@ -177,7 +182,8 @@ fn supervise(
         InitialAction::Inject => {
             let dll = locate_dll()?;
             tracing::info!("启动并注入 {} -> {}", exe.display(), dll.display());
-            let (proc, pipe_stream, pipes) = inject_and_connect(&exe, &dll, packets, cancelled)?;
+            let (proc, pipe_stream, pipes) =
+                inject_and_connect(&exe, &dll, packets, health, cancelled)?;
             peer = proc;
             stream = pipe_stream;
             aux = pipes;
@@ -192,7 +198,7 @@ fn supervise(
             peer = attach_running_process(pid);
             rounds += 1;
             session.mark_reattach_waiting();
-            match wait_for_reattach(&peer, packets, cancelled, reattach_window) {
+            match wait_for_reattach(&peer, packets, health, cancelled, reattach_window) {
                 Ok((pipe_stream, pipes)) => {
                     stream = pipe_stream;
                     aux = pipes;
@@ -241,7 +247,8 @@ fn supervise(
                              不会重启游戏，也不会重新注入",
                             reattach_window.as_secs()
                         );
-                        match wait_for_reattach(&peer, packets, cancelled, reattach_window) {
+                        match wait_for_reattach(&peer, packets, health, cancelled, reattach_window)
+                        {
                             Ok((pipe_stream, pipes)) => {
                                 stream = pipe_stream;
                                 aux = pipes;
@@ -282,12 +289,13 @@ fn inject_and_connect(
     exe: &std::path::Path,
     dll: &std::path::Path,
     packets: &Arc<PacketControl>,
+    health: &Arc<HealthState>,
     cancelled: &AtomicBool,
 ) -> Result<(SuspendedProcess, std::fs::File, AuxPipes)> {
     use std::os::windows::io::FromRawHandle;
 
     let mut pipe = create_pipe()?;
-    let mut aux = AuxPipes::open(packets);
+    let mut aux = AuxPipes::open(packets, health);
     if let Err(error) = check_cancelled(cancelled) {
         aux.retire(packets);
         return Err(error);
@@ -867,6 +875,7 @@ fn reattach_failure_to_result(failure: ConnectFailure, proc: &SuspendedProcess) 
 fn wait_for_reattach(
     proc: &SuspendedProcess,
     packets: &Arc<PacketControl>,
+    health: &Arc<HealthState>,
     cancelled: &AtomicBool,
     window: Duration,
 ) -> std::result::Result<(std::fs::File, AuxPipes), ConnectFailure> {
@@ -874,7 +883,7 @@ fn wait_for_reattach(
 
     let deadline = Instant::now() + window;
     let mut pipe = create_pipe_within(proc, cancelled, deadline)?;
-    let mut aux = AuxPipes::open(packets);
+    let mut aux = AuxPipes::open(packets, health);
     if let Err(failure) = connect_pipe_until(
         &mut pipe,
         PIPE_NAME,
@@ -996,7 +1005,11 @@ fn wait_for_game(proc: &SuspendedProcess, cancelled: &AtomicBool) -> Result<()> 
     Ok(())
 }
 
-/// debug（全包数据）与 control（模式开关）两条辅助管道。
+/// 只在第一次创建健康管道时说明一次：旧 DLL 根本没有这条管道，
+/// /health 的 dll.state 会一直是 unknown；这不是错误，不要刷日志。
+static HEALTH_PIPE_INFO: std::sync::Once = std::sync::Once::new();
+
+/// debug（全包数据）、control（模式开关）与 health（DLL 心跳）三条辅助管道。
 ///
 /// 它们都是可选增强：创建/重连失败只记警告，绝不影响聊天主通道。
 ///
@@ -1006,19 +1019,29 @@ fn wait_for_game(proc: &SuspendedProcess, cancelled: &AtomicBool) -> Result<()> 
 struct AuxPipes {
     debug: Option<std::thread::JoinHandle<()>>,
     control: Option<std::thread::JoinHandle<()>>,
+    health: Option<std::thread::JoinHandle<()>>,
     /// 通知 debug 读线程退出（它在空转时每 20ms 检查一次）。
     debug_stop: Arc<AtomicBool>,
+    /// 通知 health 读线程退出（同样短睡眠轮询）。
+    health_stop: Arc<AtomicBool>,
+    /// 会话结束/reattach 时重置 /health 的 dll 状态；health.rs 是协议，不放运行时状态。
+    health_state: Arc<HealthState>,
 }
 
 impl AuxPipes {
-    /// 创建两条辅助管道并启动各自的线程；失败只记警告。
-    fn open(packets: &Arc<PacketControl>) -> Self {
+    /// 创建辅助管道并启动各自的线程；失败只记警告。
+    fn open(packets: &Arc<PacketControl>, health: &Arc<HealthState>) -> Self {
         use windows_sys::Win32::Storage::FileSystem::{PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND};
 
+        // 新会话 / 新一轮 reattach：state 回到 unknown，直到首个心跳。
+        health.reset_session();
         let mut aux = Self {
             debug: None,
             control: None,
+            health: None,
             debug_stop: Arc::new(AtomicBool::new(false)),
+            health_stop: Arc::new(AtomicBool::new(false)),
+            health_state: Arc::clone(health),
         };
         match create_named_pipe_server(DEBUG_PIPE_NAME, PIPE_ACCESS_INBOUND) {
             Ok(pipe) => {
@@ -1034,6 +1057,22 @@ impl AuxPipes {
             Err(error) => {
                 tracing::warn!("控制管道创建失败，debug 开关不可用（聊天不受影响）：{error:#}")
             }
+        }
+        // 健康管道：DLL → 宿主单向心跳。可选增强：创建失败只 warn。
+        match create_named_pipe_server(health::PIPE_NAME, PIPE_ACCESS_INBOUND) {
+            Ok(pipe) => {
+                aux.health =
+                    start_health_pipe(pipe, Arc::clone(health), Arc::clone(&aux.health_stop));
+                HEALTH_PIPE_INFO.call_once(|| {
+                    tracing::info!(
+                        "健康管道已创建（{}）；旧 DLL 不会连接这条管道，/health dll.state 将保持 unknown，这不是错误",
+                        health::PIPE_NAME
+                    );
+                });
+            }
+            Err(error) => tracing::warn!(
+                "健康管道创建失败，/health dll.state 将保持 unknown（聊天不受影响）：{error:#}"
+            ),
         }
         aux
     }
@@ -1059,6 +1098,15 @@ impl AuxPipes {
         if let Some(handle) = self.debug.take() {
             join_bounded(handle, Duration::from_secs(2), "debug");
         }
+
+        // health：客户端写（server 是 PIPE_ACCESS_INBOUND）。
+        self.health_stop.store(true, Ordering::Release);
+        wake_pipe_client(health::PIPE_NAME, GENERIC_WRITE);
+        if let Some(handle) = self.health.take() {
+            join_bounded(handle, Duration::from_secs(2), "health");
+        }
+        // 会话结束/进入下一轮 reattach：dll 状态回到 unknown，直到新心跳。
+        self.health_state.reset_session();
     }
 }
 
@@ -1195,6 +1243,104 @@ fn start_debug_pipe(
     }
 }
 
+/// 等待 DLL 连上健康管道，然后持续解析 28 字节心跳帧。
+///
+/// 单向、无 ACK：只由 DLL 写、宿主读。解析/状态更新都在本线程，不碰聊天。
+/// 旧 DLL 不连这条管道时线程停在 accept；retire 用 dummy 客户端唤醒。
+/// magic/version/kind 不匹配是致命错误：记 parseErrors 后停止读取，等下一轮重建。
+fn start_health_pipe(
+    pipe: PipeHandle,
+    health: Arc<HealthState>,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let raw = pipe.0 as usize;
+    std::mem::forget(pipe);
+    let spawned = std::thread::Builder::new()
+        .name("mwc-health-pipe".to_owned())
+        .spawn(move || {
+            use std::io::Read;
+            let Some(mut file) = take_connected_pipe(raw, "health") else {
+                return;
+            };
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            tracing::info!("健康管道已连接，DLL 心跳开始上报");
+            let mut buffered: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 256];
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                match poll_pipe(&file) {
+                    Ok(PipeState::Data) => match file.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+                        Err(error) => {
+                            tracing::warn!("读健康管道失败：{error}");
+                            break;
+                        }
+                    },
+                    Ok(PipeState::Empty) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    Ok(PipeState::Closed) => break,
+                    Err(error) => {
+                        tracing::warn!("检查健康管道状态失败：{error:#}");
+                        break;
+                    }
+                }
+                loop {
+                    match health::parse_health(&buffered) {
+                        Ok(Some(frame)) => {
+                            buffered.drain(..health::FRAME_SIZE);
+                            let effect = health.note_heartbeat(frame, Instant::now());
+                            if effect.recovered {
+                                tracing::info!(
+                                    "DLL 健康心跳恢复（seq={}），/health dll.state 恢复正常",
+                                    frame.seq
+                                );
+                            }
+                            // "DLL 活着但不干活"是本功能存在的理由，必须留下可追溯的日志，
+                            // 而不是只藏在一个需要主动查询的 /health 字段里。
+                            if effect.disabled_edge {
+                                tracing::warn!(
+                                    "DLL 报告聊天转发已停用（PacketOutbox.Disabled，seq={}，                                     累计超时 {} 次，放弃任务 {} 个）：DLL 进程仍在、心跳继续，                                     但不再转发任何聊天包；恢复需重启游戏或等其自愈重连",
+                                    frame.seq,
+                                    frame.timeout_count,
+                                    frame.abandoned_tasks
+                                );
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let count = health.note_parse_error();
+                            if count == 1 || count.is_multiple_of(1024) {
+                                tracing::warn!(
+                                    "健康管道协议不匹配（累计 {count} 次，可能是旧 DLL 或串道数据）：{error}；停止读取该管道，等待重建"
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            tracing::info!("健康管道已关闭");
+        });
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            tracing::warn!("启动健康管道线程失败：{error}");
+            // SAFETY: 句柄来自 CreateNamedPipeW 且尚未转交。
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(raw as *mut std::ffi::c_void);
+            }
+            None
+        }
+    }
+}
+
 /// 阻塞等待一条已创建的命名管道被客户端连接，成功后转成 File。
 fn take_connected_pipe(raw: usize, label: &str) -> Option<std::fs::File> {
     use std::os::windows::io::FromRawHandle;
@@ -1219,7 +1365,7 @@ fn accept_pipe(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
     match error.raw_os_error() {
         // ERROR_PIPE_CONNECTED：客户端已经连上，视为成功。
         Some(535) => Ok(()),
-        _ => Err(error).context("等待 debug/control 管道连接失败"),
+        _ => Err(error).context("等待辅助管道连接失败"),
     }
 }
 

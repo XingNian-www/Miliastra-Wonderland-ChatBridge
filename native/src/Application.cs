@@ -26,6 +26,10 @@ internal static unsafe class Application {
         }
         try {
             Native.RegisterUnhandledExceptionHandler();
+            // P3-2：钉住注入 DLL，防止游戏/加载器 FreeLibrary 后钩子与后台线程代码失效。
+            if (!Native.PinCurrentModule((nint) (delegate* unmanaged<nint, uint>) &Awake)) {
+                Log.Warn("Pin 当前 DLL 模块失败（游戏若卸载 DLL 可能崩溃）");
+            }
             Log.UseConsoleOutput();
             Log.Trace("~");
             Goshujin.Init();
@@ -42,7 +46,11 @@ internal static unsafe class Application {
             Goshujin.LoadMethodTable();
             Goshujin.ResumeMainThread();
             //
-            Native.WaitMainWindow();
+            // P2-2：窗口等待有上限；超时也继续安装钩子（ToInt32 不依赖窗口），
+            // 避免窗口探测失败时 Awake 永久卡住、宿主看到"已连接但零包"。
+            if (!Native.WaitMainWindow()) {
+                Log.Warn("等待游戏主窗口超时，继续安装钩子（聊天转发不依赖窗口）");
+            }
             Log.ResetConsole();
             //
             // 只需要 ToInt32：它是网络包的入口，聊天数据全部从这里经过。
@@ -56,9 +64,23 @@ internal static unsafe class Application {
                 ref _toInt32);
             return 0;
         } catch (Exception ex) {
-            Interlocked.Exchange(ref _forwardingDisabled, 1);
-            Log.Error($"Native initialization failed: {ex.Message}");
+            AbortInitialization(ex.Message);
             return 1;
+        }
+    }
+
+    /// <summary>
+    /// 初始化失败收尾：置停转发、关闭主通道（宿主立即看到 EOF，而不是半活 DLL），
+    /// 并记录失败原因。独立出来便于回归测试（P2-3）。
+    /// </summary>
+    internal static void AbortInitialization(string reason) {
+        Interlocked.Exchange(ref _forwardingDisabled, 1);
+        Log.Error($"Native initialization failed: {reason}");
+        try {
+            // PacketOutbox.Disable -> Goshujin.Shutdown：关闭主通道并进入终态，宿主不再空等。
+            PacketOutbox.Disable($"native initialization failed: {reason}");
+        } catch {
+            // 收尾路径绝不能再抛异常。
         }
     }
 
@@ -75,8 +97,16 @@ internal static unsafe class Application {
 
     private static nint _toInt32;
     private static int _forwardingDisabled;
+    private static long _invalidPacketLengthCount;
+    private static long _forwardErrorLogCount;
     // Must match the host pipe protocol MAX_PAYLOAD (1 MiB).
     internal const uint MaxPacketDataLength = 1024 * 1024;
+
+    /// <summary>
+    /// 因 native 长度字段不可信而丢弃的包数（观测用）。见 <see cref="OnToInt32"/>：
+    /// 这类包绝不做无边界指针运算（越界读的 AccessViolation 无法被托管 catch 捕获）。
+    /// </summary>
+    internal static long InvalidPacketLengthCount => Interlocked.Read(ref _invalidPacketLengthCount);
 
     /// <summary>宿主是否订阅了这个 cmd。保持与原有实现相同的锁语义。</summary>
     internal static bool IsRequired(ushort cmdId) {
@@ -103,12 +133,17 @@ internal static unsafe class Application {
         void* unzipBuf = null;
         try {
             // IL2CPP byte[] 的 native 长度紧挨在数据之前（偏移 0x18）。
-            // 但这个布局是推断值：若读出来不合理，就退化为 0（未知长度），
-            // 跳过边界检查继续解析，而不是把包全丢掉。
+            // 这个布局是推断值；长度不可信时**直接丢弃该包**：绝不退化成"无边界检查"，
+            // 因为随后按包内长度做指针运算时，越界读产生的 AccessViolation 无法被
+            // 本方法的托管 catch 捕获，会直接终止游戏进程（复核 P1-3）。
             var packetLength = *(nuint*) (val + 0x18);
             if (packetLength < 12 || packetLength > int.MaxValue) {
-                Log.Warn($"packetLength 异常({packetLength})，退化为无边界检查");
-                packetLength = 0;
+                var invalidCount = Interlocked.Increment(ref _invalidPacketLengthCount);
+                // 限流：异常长度若持续出现（例如游戏布局变化），不要让日志本身变成负担。
+                if (invalidCount <= 5 || invalidCount % 1024 == 0) {
+                    Log.Warn($"packetLength 异常({packetLength})，丢弃该包（累计 {invalidCount} 次）");
+                }
+                return ret;
             }
             val += 0x20;
             if (*(ushort*) val != 0x6745) {
@@ -144,7 +179,12 @@ internal static unsafe class Application {
             Log.Warn($"Packet forwarding disabled: {ex.Message}");
         } catch (Exception ex) {
             // This observer must not propagate managed errors across the unmanaged hook.
-            Log.Error($"Failed to forward packet: {ex.Message}");
+            // M3：异常包可能每包都走这里；OutputDebugStringW 在 DebugView 监听时是同步 IPC，
+            // 不能在游戏网络线程上无节制地刷。与 packetLength 日志一样限流（前 5 次 + 每 1024 次）。
+            var errorCount = Interlocked.Increment(ref _forwardErrorLogCount);
+            if (errorCount <= 5 || errorCount % 1024 == 0) {
+                Log.Error($"Failed to forward packet: {ex.Message}（累计 {errorCount} 次）");
+            }
         } finally {
             // Covers success, decompression failure, malformed headers and pipe errors.
             NativeMemory.Free(unzipBuf);
@@ -160,7 +200,8 @@ internal static unsafe class Application {
         if (dataLen > MaxPacketDataLength) {
             return false;
         }
-        // packetLength 未知（0）时跳过边界检查：保持与上游一致的行为。
+        // 调用方（OnToInt32）已保证 packetLength >= 12；保留 >0 防御是为了让
+        // 测试/未来调用方在传入未知长度时也不会做无边界读取。
         if (packetLength > 0
             && (headLen > packetLength - 12 || dataLen > (uint) (packetLength - 12 - headLen))) {
             return false;

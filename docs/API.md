@@ -43,10 +43,13 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 
 鉴权通过后返回 `200`，数据源是否可用由 `gameConnected` 表示；会话是否接入、是否正在等待 DLL 重连由新增的 `attached` / `reattachWaiting` / `reattachAttempts` 表示。
 
+`bootId` 是宿主进程的启动标识（uint64）：同一进程内恒定，宿主重启后变化。消息 `id` 每次进程重启都从 1 重新计数，因此 `lastMessageId` 只在同一 `bootId` 内单调；客户端检测到 `bootId` 变化或 `lastMessageId` 小于本地已处理序号时，必须重置消息游标/水位，否则重启后的新消息会被误当成历史丢弃。
+
 ```json
 {
   "ok": true,
   "version": "0.1.0",
+  "bootId": 1802240000000000,
   "uptimeSec": 3600,
   "gameConnected": true,
   "attached": true,
@@ -280,12 +283,12 @@ GET /names?uids=100000001,100000002
 
 | `type` | 字段 | 说明 |
 |---|---|---|
-| `hello` | `version`、`lastMessageId` | 连接后的首个事件 |
+| `hello` | `version`、`lastMessageId`、`bootId`、`gameConnected`、`attached`、`reattachWaiting` | 连接后的首个事件；后四个字段是连接时刻的快照 |
 | `message` | `message` | 一条 ChatMessage |
 | `hall_changed` | `hallId`、`hallType` | 大厅状态变化 |
 
 ```json
-{"type":"hello","version":"0.1.0","lastMessageId":42}
+{"type":"hello","version":"0.1.0","lastMessageId":42,"bootId":1802240000000000,"gameConnected":true,"attached":true,"reattachWaiting":false}
 ```
 
 ```json
@@ -295,6 +298,19 @@ GET /names?uids=100000001,100000002
 ```json
 {"type":"hall_changed","hallId":1000000000000000001,"hallType":16}
 ```
+
+`hello` 的各字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `version` | string | 宿主版本 |
+| `lastMessageId` | uint64 | 当前进程内的最大消息 `id`；重启后归零 |
+| `bootId` | uint64 | 进程启动标识：同进程内恒定、重启后变化；用于检测宿主重启并重置游标 |
+| `gameConnected` | bool | 连接时刻游戏/DLL 是否已接入（同 `/health`） |
+| `attached` | bool | 连接时刻是否有活跃会话（DLL 已连上管道并在收包） |
+| `reattachWaiting` | bool | 连接时刻是否正在等待 DLL 重连（reattach 窗口） |
+
+新增字段向后兼容：旧客户端忽略即可，既有字段名未改动。`gameConnected` / `attached` / `reattachWaiting` 只是**连接时刻快照**，之后会随 DLL 断开/重连变化；客户端应通过轮询 `/health` 或后续消息判断当前状态。**上游必须**在 `bootId` 变化，或 `lastMessageId` 小于本地已处理序号时重置游标/水位——宿主重启后 `id` 从 1 重新计数，否则新消息会被当成历史丢弃。`gameConnected=false` 时不应把外部聊天源视为"已接管"（否则会关闭 OCR 等兜底通道）。
 
 服务端每 30 秒发送 Ping；客户端应在 10 秒内回复相同 payload 的 Pong，超时以关闭码 `1008` 断连。订阅积压导致事件丢失时，以 `1013` 断连；客户端应重连并通过 `/messages?since=<最后处理的ID>` 补拉，合并实时事件时按 `id` 去重。客户端发送的业务文本会被忽略。
 

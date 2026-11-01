@@ -35,6 +35,28 @@ pub struct AppState {
     /// 会话附着状态（attached / reattach 等待与轮数），由 main 构造、
     /// inject 更新；/health 只读。
     pub session: Arc<crate::SessionStatus>,
+    /// 进程启动标识：main 构造时生成一次，生命周期内不变。
+    ///
+    /// 消息 id 每次进程重启都从 1 开始；上游用 bootId 区分「同一进程内
+    /// 序号异常回退」与「宿主重启（应重置游标）」。同时暴露在 /health 与
+    /// WS hello，便于上游确认自己连的是哪个实例。
+    pub boot_id: u64,
+}
+
+/// 生成进程级 bootId：启动时刻的 Unix 毫秒 + 10 位随机低位。
+///
+/// - 不用 pid：系统会复用；
+/// - 不用纯时间戳：同一毫秒内的快速重启/双实例区分不开；
+/// - 左移 10 位后仍小于 2^53，浏览器按无损整数解析也不会丢精度。
+///
+/// 只在 main 构造 AppState 时调用一次；之后只读，所以 /health 与 hello
+/// 永远给出同一个值。
+pub fn generate_boot_id() -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    (millis << 10) | (rand::random::<u64>() & 0x3ff)
 }
 
 /// 组装路由。
@@ -157,6 +179,9 @@ async fn health(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
+        // 进程启动标识：同一进程内恒定，重启后变化。上游据此检测
+        // 「消息序号归零」，重置自己的游标/水位（见 docs/API.md）。
+        "bootId": state.boot_id,
         "uptimeSec": state.started.elapsed().as_secs(),
         "gameConnected": state.connected.load(std::sync::atomic::Ordering::Relaxed),
         // reattach 观测：attached=当前有活跃会话；reattachWaiting=正在等 DLL
@@ -413,9 +438,15 @@ where
 {
     let _subscriber = crate::diag::subscriber();
     let (mut rx, last_message_id) = state.chat.subscribe_with_last_id().await;
+    // 接入状态是"连接时刻"的快照：之后会变化（attach/detach/reattach），
+    // 客户端需要持续观测 /health，不能把 hello 里的 true 当成永久在线。
     let hello = ServerEvent::Hello {
         version: env!("CARGO_PKG_VERSION"),
         last_message_id,
+        boot_id: state.boot_id,
+        game_connected: state.connected.load(std::sync::atomic::Ordering::Relaxed),
+        attached: state.session.attached(),
+        reattach_waiting: state.session.reattach_waiting(),
     };
     if send_event(&mut socket, &hello, None).await.is_err() {
         return;
@@ -571,6 +602,7 @@ mod tests {
             // 单测里没有 DLL：默认 chat，控制管道未连接。
             packets: PacketControl::new(PacketMode::Chat, None),
             session: crate::SessionStatus::new(),
+            boot_id: 12345,
         })
     }
 
@@ -663,6 +695,18 @@ mod tests {
         let value = get_health(Arc::clone(&state)).await;
         assert_eq!(value["reattachWaiting"], true);
         assert_eq!(value["reattachAttempts"], 2);
+    }
+
+    #[tokio::test]
+    async fn health_reports_stable_boot_id() {
+        // bootId 由 main 在进程启动时生成一次；同一 AppState 的多次查询必须一致，
+        // 否则上游会误判宿主反复重启、不断重置游标。
+        let state = app_state(false);
+        let first = get_health(Arc::clone(&state)).await;
+        let second = get_health(Arc::clone(&state)).await;
+        assert_eq!(first["bootId"], 12345);
+        assert_eq!(second["bootId"], 12345);
+        assert_eq!(first["bootId"], second["bootId"]);
     }
 
     /// 构造 /debug/packets 请求：GET 无 body，POST 可带 JSON。
@@ -890,6 +934,49 @@ mod tests {
         );
         task.abort();
         let _ = task.await;
+    }
+
+    /// 连接 mock socket，只取第一条 hello 帧（其余事件不消费）。
+    async fn read_hello(state: Arc<AppState>) -> serde_json::Value {
+        let (socket, _input, mut output, _release) = mock_socket();
+        let task = tokio::spawn(handle_socket(socket, state));
+        let Message::Text(text) = output.recv().await.unwrap() else {
+            panic!("expected hello")
+        };
+        task.abort();
+        let _ = task.await;
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn hello_includes_boot_id_and_session_state() {
+        let state = app_state(false);
+
+        // 等待 DLL 重连：未接入、gameConnected=false、reattachWaiting=true。
+        state.session.mark_reattach_waiting();
+        let hello = read_hello(Arc::clone(&state)).await;
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["bootId"], 12345);
+        assert_eq!(hello["bootId"], state.boot_id);
+        assert_eq!(hello["gameConnected"], false);
+        assert_eq!(hello["attached"], false);
+        assert_eq!(hello["reattachWaiting"], true);
+        assert_eq!(hello["lastMessageId"], 0);
+        assert!(hello["version"].is_string());
+
+        // 与 /health 的 bootId 必须一致：两处都读同一个 AppState 字段。
+        let health = get_health(Arc::clone(&state)).await;
+        assert_eq!(hello["bootId"], health["bootId"]);
+
+        // 重连成功：已接入、不再等待、gameConnected=true。
+        state
+            .connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state.session.mark_attached();
+        let hello = read_hello(Arc::clone(&state)).await;
+        assert_eq!(hello["gameConnected"], true);
+        assert_eq!(hello["attached"], true);
+        assert_eq!(hello["reattachWaiting"], false);
     }
 
     #[tokio::test]

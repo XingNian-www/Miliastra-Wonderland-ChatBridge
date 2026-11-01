@@ -6,6 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- m6：与生产一致地编译日志调用点，回归可以直接断言真实 Log.* 路径，而不只是反射 WriteLog 本体。 -->
+    <DefineConstants>$(DefineConstants);EnableLogging</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../src/**/*.cs" />

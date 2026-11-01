@@ -23,6 +23,17 @@ internal static class Log {
 
     private static TextWriter? _consoleWriter;
 
+    /// <summary>
+    /// 单条调试器日志的最大正文字符数（有界输出，避免异常消息/超大命令刷爆调试器）。
+    /// </summary>
+    private const int MaxDebuggerBodyChars = 2048;
+
+    /// <summary>
+    /// 回归测试注入点：替换真实的 Kernel32!OutputDebugStringW，便于在非 Windows
+    /// 环境验证格式化与投递（生产保持 null，直接走 OutputDebugStringW）。
+    /// </summary>
+    internal static Action<string>? OutputSinkForTest { get; set; }
+
     // 两个符号刻意分开：
     //   EnableLogging        —— 控制日志代码是否编译进产物（生产必须开启）。
     //   EnableConsoleOutput  —— 只控制是否给游戏进程分配控制台（生产不定义，
@@ -119,6 +130,21 @@ internal static class Log {
                 // 控制台句柄被关闭/重定向失败时吞掉异常：日志绝不能把异常带回游戏线程
                 // 或后台发送/重连线程（NativeAOT 下会触发进程级未处理异常，直接杀游戏）。
             }
+        } else {
+            // 生产 Release 不定义 EnableConsoleOutput，_consoleWriter 恒为 null。
+            // 输出到 OutputDebugStringW（零窗口、零文件），DebugView / ProcMon / 调试器可抓；
+            // 测试用 OutputSinkForTest 替换 P/Invoke 以在非 Windows 环境验证。
+            try {
+                var line = FormatDebuggerLine(time, message, tag, level);
+                if (OutputSinkForTest is { } sink) {
+                    sink(line);
+                } else {
+                    Kernel32.OutputDebugStringW(line);
+                }
+            } catch {
+                // 日志绝不能把异常带回游戏线程/后台线程：OutputDebugString 不可用、
+                // 测试 sink 抛异常等一律静默丢弃。
+            }
         }
         if (level == LogLevel.Fatal) {
             if (_consoleWriter != null) {
@@ -128,5 +154,25 @@ internal static class Log {
                 User32.MessageBoxW(0, "An critical error occurred.", "Error", 0x10);
             }
         }
+    }
+
+    /// <summary>
+    /// 调试器输出行格式（有界）：[MWC][HH:mm:ss.fff][LEVEL] Tag : message。
+    /// 前缀 MWC 方便在 DebugView 里过滤其它进程；正文超过上限截断。
+    /// </summary>
+    private static string FormatDebuggerLine(string time, string message, string tag, LogLevel level) {
+        var levelText = level switch {
+            LogLevel.Error or LogLevel.Fatal => "ERROR",
+            LogLevel.Warn => "WARN",
+            LogLevel.Info => "INFO",
+            LogLevel.Debug => "DEBUG",
+            LogLevel.Trace => "TRACE",
+            LogLevel.Time => "TIME",
+            _ => "LOG",
+        };
+        var body = message.Length > MaxDebuggerBodyChars
+            ? message[..MaxDebuggerBodyChars] + "...(truncated)"
+            : message;
+        return $"[MWC][{time}][{levelText}] {tag} : {body}";
     }
 }

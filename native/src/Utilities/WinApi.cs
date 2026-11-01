@@ -12,6 +12,14 @@ internal static unsafe partial class Kernel32 {
     [LibraryImport("KERNEL32.dll", SetLastError = true)]
     internal static partial nint GetModuleHandleW(char* lpModuleName);
 
+    internal const uint GET_MODULE_HANDLE_EX_FLAG_PIN = 0x00000001;
+    internal const uint GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004;
+
+    /// <summary>按地址取模块句柄（配合 PIN 标志可钉住注入 DLL，防止被 FreeLibrary）。</summary>
+    [return: MarshalAs(UnmanagedType.I4)]
+    [LibraryImport("KERNEL32.dll", SetLastError = true)]
+    internal static partial bool GetModuleHandleExW(uint dwFlags, nint lpModuleName, nint* phModule);
+
     [LibraryImport("KERNEL32.dll", SetLastError = true)]
     internal static partial uint GetModuleFileNameW(nint hModule, char* lpFilename, uint nSize);
 
@@ -46,6 +54,10 @@ internal static unsafe partial class Kernel32 {
     
     [LibraryImport("KERNEL32.dll", SetLastError = true)]
     internal static partial nint CreateThread(nint lpThreadAttributes, nint dwStackSize, delegate*unmanaged<nint, uint> lpStartAddress, nint lpParameter, uint dwCreationFlags, uint* lpThreadId);
+
+    /// <summary>把字符串送到调试器输出（DebugView / ProcMon / 调试器可抓），不创建控制台窗口。</summary>
+    [LibraryImport("KERNEL32.dll", StringMarshalling = StringMarshalling.Utf16)]
+    internal static partial void OutputDebugStringW(string lpOutputString);
 
 }
 

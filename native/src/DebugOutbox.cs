@@ -44,7 +44,10 @@ internal static class DebugOutbox {
     /// <summary>每丢弃这么多次才记一行 Warn，避免刷屏。</summary>
     private const int DropLogInterval = 1024;
 
-    private static readonly System.Threading.Channels.Channel<PendingPacket> Queue =
+    // 可替换：宿主 reattach 后允许重建 debug 通道（P2-4），旧队列由 Disable 放弃。
+    private static System.Threading.Channels.Channel<PendingPacket> Queue = CreateQueue();
+
+    private static System.Threading.Channels.Channel<PendingPacket> CreateQueue() =>
         System.Threading.Channels.Channel.CreateBounded<PendingPacket>(
             new System.Threading.Channels.BoundedChannelOptions(Capacity) {
                 FullMode = System.Threading.Channels.BoundedChannelFullMode.DropWrite,
@@ -53,6 +56,7 @@ internal static class DebugOutbox {
             });
 
     private static int _started;
+    private static readonly Lock _recoveryLock = new();
     private static int _disabled;
     private static long _dropped;
     private static long _copied;
@@ -61,9 +65,21 @@ internal static class DebugOutbox {
     private static int _writeTimeoutMs = DefaultWriteTimeoutMs;
     private static Stream? _pipeStream;
     private static BinaryWriter? _writer;
+    private static int _senderRunning;
+    private static int _recoveryAttempts;
+    private static int _recoveryPending;
+
+    /// <summary>debug 通道最多允许恢复几次，避免宿主/管道持续异常时形成重启风暴。</summary>
+    internal const int MaxRecoveryAttempts = 3;
 
     /// <summary>debug 通道是否已停用（连接失败/写失败/写超时后置位）。</summary>
     internal static bool Disabled => Volatile.Read(ref _disabled) != 0;
+
+    /// <summary>发送线程是否仍在运行（恢复前必须等旧线程退出，避免单 reader 竞争）。</summary>
+    internal static bool SenderRunning => Volatile.Read(ref _senderRunning) != 0;
+
+    /// <summary>连续恢复尝试次数（连接成功后归零；达到上限后需等下一次显式触发）。</summary>
+    internal static int RecoveryAttempts => Volatile.Read(ref _recoveryAttempts);
 
     /// <summary>累计丢弃的包数（队列满或超过字节上限）。</summary>
     internal static long Dropped => Interlocked.Read(ref _dropped);
@@ -92,7 +108,47 @@ internal static class DebugOutbox {
             IsBackground = true,
             Name = "mwc-debug-sender",
         };
-        thread.Start();
+        try {
+            thread.Start();
+        } catch (Exception ex) {
+            Volatile.Write(ref _started, 0);
+            Disable($"debug 发送线程启动失败: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 宿主 reattach 重建 debug 管道、或控制模式重新切到 all 时调用：若 debug 通道此前
+    /// 已终态 Disable，则重建队列与发送线程（最多 <see cref="MaxRecoveryAttempts"/> 次，
+    /// 避免反复失败形成风暴）。只影响 debug，绝不触碰聊天通道（P2-4）。
+    /// </summary>
+    internal static bool RequestRecovery(string reason) {
+        using (_recoveryLock.EnterScope()) {
+            if (!Disabled) {
+                return false; // 未停用，无需恢复
+            }
+            if (SenderRunning) {
+                // 旧发送线程还没退出：记下待恢复，由 SenderLoop 的 finally 在本轮退出后重试，
+                // 避免"控制重连恰好撞上 Disable 收尾"导致 debug 永远不再恢复（P2-4）。
+                Interlocked.Exchange(ref _recoveryPending, 1);
+                return false;
+            }
+            if (Volatile.Read(ref _started) != 0) {
+                return false; // 正在启动
+            }
+            var attempts = Interlocked.Increment(ref _recoveryAttempts);
+            if (attempts > MaxRecoveryAttempts) {
+                Log.Warn($"debug 通道恢复次数达到上限 {MaxRecoveryAttempts}，放弃恢复（{reason}）");
+                return false;
+            }
+            Log.Warn($"重新启动 debug 通道（{reason}，第 {attempts}/{MaxRecoveryAttempts} 次）");
+            Queue = CreateQueue();
+            Interlocked.Exchange(ref _queuedBytes, 0);
+            Interlocked.Exchange(ref _queuedItems, 0);
+            Volatile.Write(ref _disabled, 0);
+            Volatile.Write(ref _started, 0);
+            Start();
+            return !Disabled;
+        }
     }
 
     /// <summary>
@@ -119,7 +175,8 @@ internal static class DebugOutbox {
         }
         var copy = data.ToArray();
         Interlocked.Increment(ref _copied);
-        if (!Queue.Writer.TryWrite(new PendingPacket { Cmd = cmd, Data = copy })) {
+        var queue = Queue;
+        if (!queue.Writer.TryWrite(new PendingPacket { Cmd = cmd, Data = copy })) {
             // 只会发生在通道被完成之后（Disable）；回滚额度再计数。
             Interlocked.Add(ref _queuedBytes, -size);
             Interlocked.Decrement(ref _queuedItems);
@@ -133,7 +190,10 @@ internal static class DebugOutbox {
             return;
         }
         Log.Warn($"停止转发 debug 包: {reason}（已丢弃 {Dropped} 份副本）");
-        Queue.Writer.TryComplete();
+        // 允许后续 RequestRecovery 重建发送线程；真正的竞争由 SenderRunning 守卫。
+        Volatile.Write(ref _started, 0);
+        var queue = Queue;
+        queue.Writer.TryComplete();
         // dispose 管道是让"阻塞中的写"退出的关键：否则发送线程会永久卡在 WriteFile。
         try {
             _writer?.Dispose();
@@ -164,8 +224,21 @@ internal static class DebugOutbox {
     }
 
     private static void SenderLoop() {
+        Volatile.Write(ref _senderRunning, 1);
         try {
-            // 懒连接只发生在后台线程：旧宿主没有这条管道时，5s 后超时并永久停用 debug。
+            SenderLoopCore();
+        } finally {
+            Volatile.Write(ref _senderRunning, 0);
+            if (Interlocked.Exchange(ref _recoveryPending, 0) != 0) {
+                // 上一次恢复请求因旧线程未退被延后；这里在线程真正退出后补一次。
+                RequestRecovery("延迟恢复（旧发送线程已退出）");
+            }
+        }
+    }
+
+    private static void SenderLoopCore() {
+        try {
+            // 懒连接只发生在后台线程：旧宿主没有这条管道时，5s 后超时并停用 debug。
             // 先保存到字段，连接失败时交给 Disable 统一关闭，避免句柄泄漏。
             var pipe = ConnectStream();
             _pipeStream = pipe;
@@ -176,6 +249,9 @@ internal static class DebugOutbox {
             return;
         }
         Log.Trace("Debug pipe connected.");
+        // 成功连上说明本轮恢复有效；把"连续恢复失败"计数归零，避免多天多次宿主重启后
+        // 过早用尽恢复次数（上限只约束连续失败的风暴场景）。
+        Interlocked.Exchange(ref _recoveryAttempts, 0);
         while (true) {
             PendingPacket packet;
             try {
@@ -220,6 +296,11 @@ internal static class DebugOutbox {
         });
         try {
             if (!task.Wait(WriteTimeoutMs)) {
+                if (!task.IsCompleted) {
+                    // debug 写也可能卡在同步管道 IO 上；只计入 debug 自己的观测计数，
+                    // 绝不参与聊天终态阈值（M1：debug 失败不能停掉聊天）。
+                    Goshujin.TrackDebugAbandonedIoTask(task);
+                }
                 return false;
             }
             return !task.IsFaulted && task.Result;
@@ -234,7 +315,17 @@ internal static class DebugOutbox {
             return factory();
         }
         var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
-        pipe.Connect(ConnectTimeoutMs);
-        return pipe;
+        try {
+            pipe.Connect(ConnectTimeoutMs);
+            return pipe;
+        } catch {
+            // Connect 抛异常时句柄仍在 pipe 里，必须 dispose，避免恢复/重试时泄漏。
+            try {
+                pipe.Dispose();
+            } catch {
+                // 关闭过程中的异常无需处理。
+            }
+            throw;
+        }
     }
 }

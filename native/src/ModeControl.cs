@@ -82,6 +82,19 @@ internal static class ModeControl {
     internal static void SetAllPacketsForTest(bool allPackets) =>
         Volatile.Write(ref _allPackets, allPackets ? 1 : 0);
 
+    /// <summary>
+    /// 应用宿主下发的模式字节。chat→all 时尝试恢复此前被停用的 debug 通道（宿主可能
+    /// 已 reattach 并重建 debug 管道，P2-4）；all→chat 时无需动作（钩子会停止入队）。
+    /// </summary>
+    internal static void ApplyMode(int mode) {
+        var previous = Volatile.Read(ref _allPackets);
+        var next = mode == 1 ? 1 : 0;
+        Volatile.Write(ref _allPackets, next);
+        if (next == 1 && previous == 0) {
+            DebugOutbox.RequestRecovery("控制模式切到 all");
+        }
+    }
+
     private static void ControlLoop() {
         var delay = ReconnectInitialDelayMs;
         while (true) {
@@ -89,10 +102,16 @@ internal static class ModeControl {
             Stream? stream = null;
             try {
                 stream = ConnectStream();
-                Interlocked.Increment(ref _connectCount);
+                var connectCount = Interlocked.Increment(ref _connectCount);
                 // 连接成功后重置退避：下次断线从最小间隔重新开始。
                 delay = ReconnectInitialDelayMs;
                 Log.Trace("Mode control pipe connected.");
+                if (connectCount > 1) {
+                    // 控制管道只在宿主重启/reattach 后重连；此时主聊天管道很可能也已失效，
+                    // 但游戏空闲期没有写操作能发现。用控制通道当探测器主动回收主通道（P1-4）；
+                    // 首次连接不触发，避免 Awake 启动阶段多一次无意义的重连。
+                    Goshujin.OnControlPipeReconnected();
+                }
                 while (true) {
                     // 阻塞读：宿主每次切换模式写 1 字节，流结束（-1）表示宿主已关闭。
                     var mode = stream.ReadByte();
@@ -100,7 +119,7 @@ internal static class ModeControl {
                         Log.Warn("控制管道已断开，回落 chat 模式并等待重连");
                         break;
                     }
-                    Volatile.Write(ref _allPackets, mode == 1 ? 1 : 0);
+                    ApplyMode(mode);
                 }
             } catch (Exception ex) {
                 // 旧宿主没有控制管道，或宿主中途退出：只影响增强功能，绝不影响聊天通道。

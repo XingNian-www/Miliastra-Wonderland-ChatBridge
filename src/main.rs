@@ -235,6 +235,9 @@ fn run() -> Result<()> {
     // 会话状态由 inject（Windows）更新、/health 观测；reattach 期间它让
     // 上游能区分“正在重连”与“彻底失效”。
     let session = SessionStatus::new();
+    // 进程启动标识：同一进程内不变；WS hello 与 /health 都读它。上游靠它
+    // 检测宿主重启（消息序号归零），从而重置自己的游标/水位（见 docs/API.md）。
+    let boot_id = server::generate_boot_id();
     let app = Arc::new(server::AppState {
         chat: Arc::clone(&chat),
         token: cfg.token.clone(),
@@ -244,6 +247,7 @@ fn run() -> Result<()> {
         self_uid: cfg.self_uid,
         packets: Arc::clone(&packets),
         session: Arc::clone(&session),
+        boot_id,
     });
 
     let result = runtime.block_on(async move {
@@ -251,7 +255,7 @@ fn run() -> Result<()> {
         let port = cfg.port;
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await
             .with_context(|| format!("监听 127.0.0.1:{port} 失败"))?;
-        tracing::info!("HTTP/WS 服务已启动: http://127.0.0.1:{port}");
+        tracing::info!("HTTP/WS 服务已启动: http://127.0.0.1:{port}（bootId={boot_id}）");
         let serve = async { axum::serve(listener, server::router(app)).await.context("HTTP 服务异常退出") };
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]

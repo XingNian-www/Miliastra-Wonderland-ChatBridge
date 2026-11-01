@@ -12,13 +12,30 @@ internal static unsafe class Native {
     private static nint _hwnd;
     private static readonly uint ProcessId = Kernel32.GetCurrentProcessId();
 
-    public static void WaitMainWindow() {
+    /// <summary>等待主窗口的上限（毫秒）。窗口探测失败不应让注入线程永久卡住。</summary>
+    internal const int DefaultWaitMainWindowMs = 120_000;
+
+    /// <summary>
+    /// 等待游戏主窗口出现。返回 false 表示已超时；调用方应继续安装钩子
+    /// （ToInt32 不依赖窗口）。开始/成功/超时都会写日志（Release 走 OutputDebugStringW）。
+    /// </summary>
+    public static bool WaitMainWindow(int timeoutMs = DefaultWaitMainWindowMs) {
+        if (timeoutMs <= 0) {
+            timeoutMs = DefaultWaitMainWindowMs;
+        }
+        Log.Info($"等待游戏主窗口（最多 {timeoutMs}ms）");
+        var deadline = Environment.TickCount64 + timeoutMs;
         _hwnd = 0;
-        do {
+        while (_hwnd == 0) {
+            if (Environment.TickCount64 >= deadline) {
+                Log.Warn($"等待游戏主窗口超时（{timeoutMs}ms）：继续安装钩子，聊天转发不依赖窗口");
+                return false;
+            }
             Thread.Sleep(100);
             _ = User32.EnumWindows(&EnumWindowsCallback, 0);
-        } while (_hwnd == 0);
-        return;
+        }
+        Log.Info("游戏主窗口已就绪");
+        return true;
         [UnmanagedCallersOnly(CallConvs = [ typeof(CallConvStdcall) ])]
         static int EnumWindowsCallback(nint handle, nint extraParameter) {
             uint wProcessId = 0; // Avoid uninitialized variable if the window got closed in the meantime
@@ -76,6 +93,19 @@ internal static unsafe class Native {
         fixed (char* pName = moduleName ?? Path.GetFileName(GetModulePath(0))) {
             return Kernel32.GetModuleHandleW(pName);
         }
+    }
+
+    /// <summary>
+    /// 把当前 DLL 模块钉在进程里（GET_MODULE_HANDLE_EX_FLAG_PIN），返回是否成功。
+    /// 目的：即使游戏/加载器误调 FreeLibrary，也不要卸载装有 MinHook trampoline
+    /// 和后台线程代码的模块（否则下一次 ToInt32 会跳到未映射内存直接崩游戏）。
+    /// address 必须位于本 DLL 内；生产调用方传 &amp;Awake（[UnmanagedCallersOnly] 导出）。
+    /// </summary>
+    public static bool PinCurrentModule(nint address) {
+        nint module = 0;
+        return Kernel32.GetModuleHandleExW(
+            Kernel32.GET_MODULE_HANDLE_EX_FLAG_PIN | Kernel32.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            address, &module);
     }
 
     #endregion

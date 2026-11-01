@@ -90,7 +90,6 @@ internal static class PacketOutbox {
     private static long _dropped;
     private static int _sendTimeoutMs = DefaultSendTimeoutMs;
     private static long _timeoutCount;
-    private static int _abandonedTasks;
 
     /// <summary>是否已停止转发（终态：重连彻底失败或显式 Disable 后置位，游戏保持直通）。</summary>
     public static bool Disabled => Volatile.Read(ref _disabled) != 0;
@@ -102,11 +101,11 @@ internal static class PacketOutbox {
     internal static long TimeoutCount => Interlocked.Read(ref _timeoutCount);
 
     /// <summary>
-    /// 已被放弃、但仍卡在旧连接同步 IO 里的发送任务数（观测/回归用）。
-    /// 判定连接卡死时会把旧流 dispose 让它们尽快退出；正常情况下应回落为 0，
-    /// 长期 &gt; 0 且持续增长说明 .NET 同步管道 IO 未能被取消（见 Goshujin 类型注释）。
+    /// 已被放弃、仍可能卡在旧连接同步 IO 里的任务数（send + handshake + debug 统一计数）。
+    /// 历史名称保留为兼容别名；正常应回落为 0，持续增长会触发
+    /// <see cref="Goshujin.MaxAbandonedIoTaskCount"/> 兜底终态（P1-2）。
     /// </summary>
-    internal static int AbandonedSendTasks => Volatile.Read(ref _abandonedTasks);
+    internal static int AbandonedSendTasks => Goshujin.AbandonedIoTaskCount;
 
     /// <summary>
     /// 单次发送（写管道 + 读回执）的总超时，毫秒。0/负数会被钳到
@@ -236,29 +235,24 @@ internal static class PacketOutbox {
             // Wait 返回 false：若 Task 恰好在超时窗口末完成且没有异常，仍算成功；
             // 否则说明它还卡在 IO 里，连接已经不可用。
             if (!task.IsCompleted) {
-                TrackAbandoned(task);
+                Goshujin.TrackAbandonedIoTask(task);
                 return SendResult.TimedOutStuck;
             }
             if (task.IsFaulted) {
-                TrackAbandoned(task);
+                Goshujin.TrackAbandonedIoTask(task);
                 return SendResult.Faulted;
             }
             return SendResult.Success;
         } catch (AggregateException) {
             // Wait 在超时前就观察到任务失败（写/读异常）。
-            TrackAbandoned(task);
+            Goshujin.TrackAbandonedIoTask(task);
             return SendResult.Faulted;
         } catch {
-            TrackAbandoned(task);
+            Goshujin.TrackAbandonedIoTask(task);
             return SendResult.Faulted;
         }
     }
 
-    /// <summary>记录一个被放弃的发送任务；它退出后计数回落（观测用）。</summary>
-    private static void TrackAbandoned(Task task) {
-        Interlocked.Increment(ref _abandonedTasks);
-        _ = task.ContinueWith(_ => Interlocked.Decrement(ref _abandonedTasks), TaskScheduler.Default);
-    }
 
     /// <summary>永久停止转发：关闭管道，之后钩子只透传原始返回值。</summary>
     public static void Disable(string reason) {
@@ -293,7 +287,7 @@ internal static class PacketOutbox {
 ///
 ///   Connected --(连接不可恢复)--> Reconnecting --(握手成功)--> Connected
 ///                                               |
-///                                               +--(握手连续失败达到上限)--> Disabled（终态）
+///                                               +--(握手失败超过时间窗/次数上限)--> Disabled（终态）
 ///
 ///   - 重连全部在独立后台线程 "mwc-pipe-reconnect" 上，绝不阻塞游戏网络线程/主线程。
 ///     退避 1s/2s/4s... 封顶 30s（可配置），不会形成重连风暴；宿主长时间不在时保持
@@ -321,13 +315,39 @@ internal static class Goshujin {
     /// <summary>一次重连握手的总超时（毫秒）。</summary>
     private const int HandshakeTimeoutMs = 5000;
 
-    /// <summary>握手连续失败多少次后判定"重连彻底失败"，进入终态 Disabled。</summary>
-    internal const int MaxHandshakeFailures = 3;
+    /// <summary>
+    /// 握手失败累计多久才判定"重连彻底失败"（默认 5 分钟）。宿主 reattach 给 3×60s，
+    /// DLL 不应更早放弃；这样宿主重启/AV 扫描/短时卡顿都能等到。协议明确不兼容时
+    /// 另有 <see cref="MaxHandshakeFailures"/> 绝对次数兜底。
+    /// </summary>
+    internal const int DefaultHandshakeFailureWindowMs = 300_000;
+    internal const int MinHandshakeFailureWindowMs = 10;
+    internal const int MaxHandshakeFailureWindowMs = 3_600_000;
+
+    /// <summary>握手失败绝对次数上限（防无限重试）。</summary>
+    internal const int MaxHandshakeFailures = 30;
 
     internal const int DefaultReconnectInitialDelayMs = 1000;
     internal const int DefaultReconnectMaxDelayMs = 30000;
     internal const int MinReconnectDelayMs = 10;
     internal const int MaxReconnectDelayMs = 300000;
+
+    /// <summary>
+    /// 被放弃的聊天 IO 任务数上限（send + handshake）。Windows 同步命名管道 IO
+    /// 不保证被 Dispose 取消；达到上限说明线程池可能已被持续占用，继续自愈风险更高，
+    /// 因此停止重连并进入明确终态（P1-2）。debug 任务单列，不参与该阈值（M1）。
+    /// </summary>
+    internal const int MaxAbandonedIoTaskCount = 6;
+
+    /// <summary>
+    /// 控制管道重连时，只有主通道"已连接超过"这么久才主动回收它。
+    /// 宿主 reattach 可能存在竞速（主通道先连上、控制通道后连上）；若不做陈旧判定，
+    /// 每轮控制重连都会把刚恢复的主通道再关一次，几秒内耗光 3 轮 reattach 窗口（B1）。
+    /// </summary>
+    internal const int ControlReconnectStalenessMs = 10_000;
+
+    /// <summary>两次握手失败间隔超过该值，视为新一段连续失败（M2）。</summary>
+    internal const int HandshakeFailureGapResetMs = 60_000;
 
     /// <summary>连接状态。所有迁移都通过 Interlocked/Volatile 写入 int。</summary>
     internal enum ConnectionState {
@@ -356,7 +376,13 @@ internal static class Goshujin {
     private static int _reconnectMaxDelayMs = DefaultReconnectMaxDelayMs;
     private static long _reconnectAttempts;
     private static long _handshakeFailures;
+    private static long _handshakeFailureSinceTicks;
+    private static long _lastHandshakeFailureTicks;
     private static long _lastConnectedTicks;
+    private static int _abandonedIoTaskCount;
+    private static int _abandonedDebugIoTaskCount;
+    private static long _controlReconnectTriggers;
+    private static int _handshakeFailureWindowMs = DefaultHandshakeFailureWindowMs;
 
     /// <summary>
     /// 回归测试注入点：返回一条已"连接"的流，避免测试触碰真实命名管道。
@@ -369,11 +395,99 @@ internal static class Goshujin {
     /// <summary>累计重连尝试次数（观测用）。</summary>
     internal static long ReconnectAttempts => Interlocked.Read(ref _reconnectAttempts);
 
-    /// <summary>当前连续握手失败次数（成功一次归零；达到 <see cref="MaxHandshakeFailures"/> 进入终态）。</summary>
+    /// <summary>当前连续握手失败次数（成功一次归零）。</summary>
     internal static long HandshakeFailures => Interlocked.Read(ref _handshakeFailures);
+
+    /// <summary>
+    /// 判定握手彻底失败的累计时间窗（毫秒）；默认 5 分钟，测试可调小。
+    /// 与 <see cref="MaxHandshakeFailures"/> 共同决定是否进入终态（P2-1）。
+    /// </summary>
+    internal static int HandshakeFailureWindowMs {
+        get => Volatile.Read(ref _handshakeFailureWindowMs);
+        set => Volatile.Write(ref _handshakeFailureWindowMs,
+            Math.Clamp(value, MinHandshakeFailureWindowMs, MaxHandshakeFailureWindowMs));
+    }
 
     /// <summary>上次成功连接的时刻（Environment.TickCount64，观测用；0 表示从未连上）。</summary>
     internal static long LastConnectedTicks => Volatile.Read(ref _lastConnectedTicks);
+
+    /// <summary>被放弃的聊天 IO 任务数（send + handshake；用于聊天终态判定）。</summary>
+    internal static int AbandonedIoTaskCount => Volatile.Read(ref _abandonedIoTaskCount);
+
+    /// <summary>
+    /// 被放弃的 debug IO 任务数。与聊天计数完全隔离：debug 写超时绝不能让聊天终态，
+    /// 这是"debug 失败不影响聊天"的红线（M1）。
+    /// </summary>
+    internal static int AbandonedDebugIoTaskCount => Volatile.Read(ref _abandonedDebugIoTaskCount);
+
+    /// <summary>是否已达到 <see cref="MaxAbandonedIoTaskCount"/> 聊天兜底阈值。</summary>
+    internal static bool AbandonedIoTaskLimitReached =>
+        Volatile.Read(ref _abandonedIoTaskCount) >= MaxAbandonedIoTaskCount;
+
+    /// <summary>控制管道重连实际触发主通道回收的次数（观测/回归用，B1）。</summary>
+    internal static long ControlReconnectTriggers => Interlocked.Read(ref _controlReconnectTriggers);
+
+    /// <summary>
+    /// 登记一个被放弃、仍可能卡在旧连接同步 IO 里的聊天 Task（send/handshake）。
+    /// Task 真正退出后计数回落；达到上限只记录原因，真正的停用由 RequestReconnect/重连循环判定，
+    /// 避免在任意线程上直接 Shutdown 造成不可预期的状态迁移。
+    /// </summary>
+    internal static void TrackAbandonedIoTask(Task task) {
+        var count = Interlocked.Increment(ref _abandonedIoTaskCount);
+        if (count == MaxAbandonedIoTaskCount) {
+            Log.Error($"被放弃的聊天 IO 任务达到上限 {MaxAbandonedIoTaskCount}（当前 {count}）：" +
+                      "同步管道 IO 可能无法取消，继续重连有耗尽线程池风险，将停止自愈进入终态");
+        }
+        _ = task.ContinueWith(_ => Interlocked.Decrement(ref _abandonedIoTaskCount), TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// 登记一个被放弃的 debug IO 任务：只观测，绝不参与聊天终态判断（M1）。
+    /// debug 通道自身已经会 Disable，聊天继续按自己的健康状态工作。
+    /// </summary>
+    internal static void TrackDebugAbandonedIoTask(Task task) {
+        Interlocked.Increment(ref _abandonedDebugIoTaskCount);
+        _ = task.ContinueWith(_ => Interlocked.Decrement(ref _abandonedDebugIoTaskCount), TaskScheduler.Default);
+    }
+
+    /// <summary>回归测试用：直接设置上次成功连接时刻，构造"新鲜/陈旧"主通道场景。</summary>
+    internal static void SetLastConnectedTicksForTest(long ticks) =>
+        Volatile.Write(ref _lastConnectedTicks, ticks);
+
+    /// <summary>回归测试用：直接设置握手失败窗口起点，构造旧时间戳场景（M2）。</summary>
+    internal static void SetHandshakeFailureSinceTicksForTest(long ticks) =>
+        Volatile.Write(ref _handshakeFailureSinceTicks, ticks);
+
+    /// <summary>
+    /// 控制管道重连成功时调用（疑似宿主重启）：主动回收主聊天管道。
+    ///
+    /// 宿主重启会同时重建主/控制管道；但游戏空闲时主通道没有写操作，DLL 无法察觉旧主管道
+    /// 已失效，会一直等到下一条聊天包才重连，而宿主 reattach 窗口（60s×3）可能已耗尽。
+    /// 控制管道本来就在退避重连，直接拿它当探测器成本最低（P1-4）。
+    /// </summary>
+    internal static void OnControlPipeReconnected() {
+        var state = State;
+        // 宿主 reattach 会同时重建 debug 管道；若 debug 通道此前已终态 Disable，这里尝试恢复。
+        DebugOutbox.RequestRecovery("控制管道重连（疑似宿主重启）");
+        if (state != ConnectionState.Connected) {
+            Log.Trace($"控制管道已重连，主通道状态为 {state}，无需额外触发");
+            return;
+        }
+
+        // B1：必须做陈旧判定。reattach 存在"主通道先连上、控制通道后连上"的竞速；
+        // 若主通道刚恢复（<10s）就再主动关掉它，会消耗宿主下一轮 reattach，3 轮窗口
+        // 可能在数秒内被自噬耗尽。只有主连接确实"老了"（空闲期旧管道）才值得主动探测。
+        var last = Volatile.Read(ref _lastConnectedTicks);
+        var age = last == 0 ? long.MaxValue : Environment.TickCount64 - last;
+        if (age < ControlReconnectStalenessMs) {
+            Log.Trace($"控制管道已重连，但主通道刚连接 {age}ms（<{ControlReconnectStalenessMs}ms），跳过主动回收");
+            return;
+        }
+
+        Log.Warn($"控制管道已重连，主通道已连接 {age}ms，主动回收主聊天管道（探测宿主重启）");
+        Interlocked.Increment(ref _controlReconnectTriggers);
+        _ = RequestReconnect("控制管道重连（疑似宿主重启）");
+    }
 
     /// <summary>重连首次退避（毫秒），默认 1000；测试可调小。</summary>
     internal static int ReconnectInitialDelayMs {
@@ -465,6 +579,10 @@ internal static class Goshujin {
     /// 检测到已断开时是幂等的：不会重复启动第二条重连线程，也不会形成重连风暴。
     /// </summary>
     internal static bool RequestReconnect(string reason) {
+        if (AbandonedIoTaskLimitReached) {
+            MarkDisabled($"被放弃的 IO 任务达到上限 {MaxAbandonedIoTaskCount}（当前 {AbandonedIoTaskCount}），停止重连");
+            return false;
+        }
         Stream? oldStream;
         using (_stateLock.EnterScope()) {
             switch (State) {
@@ -562,14 +680,19 @@ internal static class Goshujin {
 
     /// <summary>
     /// 重连循环：退避重试 + 每次成功 Connect 后做一次幂等握手。
-    /// 只有"连上了但握手连续失败达到 <see cref="MaxHandshakeFailures"/>"才进入终态；
-    /// 宿主一直不在时保持退避上限间隔持续重试（有界 CPU，无自旋）。
+    /// 只有"连上了但握手失败在时间窗内持续到 <see cref="HandshakeFailureWindowMs"/>
+    /// 或达到 <see cref="MaxHandshakeFailures"/> 绝对上限"才进入终态；宿主一直不在时
+    /// 保持退避上限间隔持续重试（有界 CPU，无自旋）。
     /// </summary>
     private static void ReconnectLoop() {
         try {
             var delay = ReconnectInitialDelayMs;
             while (true) {
-                if (State == ConnectionState.Disabled) {
+                if (State == ConnectionState.Disabled ||
+                    AbandonedIoTaskLimitReached) {
+                    if (State != ConnectionState.Disabled) {
+                        MarkDisabled($"被放弃的 IO 任务达到上限 {MaxAbandonedIoTaskCount}，停止重连");
+                    }
                     return;
                 }
                 Interlocked.Increment(ref _reconnectAttempts);
@@ -579,6 +702,8 @@ internal static class Goshujin {
                     if (TryHandshake(stream)) {
                         if (InstallConnection(stream)) {
                             Interlocked.Exchange(ref _handshakeFailures, 0);
+                            Volatile.Write(ref _handshakeFailureSinceTicks, 0);
+                            Volatile.Write(ref _lastHandshakeFailureTicks, 0);
                             Log.Info($"聊天管道重连成功（累计尝试 {ReconnectAttempts} 次）");
                             return;
                         }
@@ -596,10 +721,32 @@ internal static class Goshujin {
                         // 关闭过程中的异常无需处理。
                     }
                     stream = null;
+                    // M2：窗口必须按"连续失败"计算。若距上一次握手失败已超过
+                    // HandshakeFailureGapResetMs（例如宿主长时间不在、Connect 失败期间
+                    // 不产生握手失败），旧时间戳不能拿来提前终态；从本次失败重新起算。
+                    var now = Environment.TickCount64;
+                    var lastFailure = Volatile.Read(ref _lastHandshakeFailureTicks);
+                    if (lastFailure != 0 && now - lastFailure > HandshakeFailureGapResetMs) {
+                        Interlocked.Exchange(ref _handshakeFailures, 0);
+                        Volatile.Write(ref _handshakeFailureSinceTicks, 0);
+                    }
+                    Volatile.Write(ref _lastHandshakeFailureTicks, now);
                     var failures = Interlocked.Increment(ref _handshakeFailures);
-                    Log.Warn($"重连握手失败（连续 {failures}/{MaxHandshakeFailures}）");
-                    if (failures >= MaxHandshakeFailures) {
-                        MarkDisabled($"重连握手连续失败 {failures} 次");
+                    var since = Volatile.Read(ref _handshakeFailureSinceTicks);
+                    if (since == 0) {
+                        since = now;
+                        Volatile.Write(ref _handshakeFailureSinceTicks, since);
+                    }
+                    var elapsed = now - since;
+                    Log.Warn($"重连握手失败（连续 {failures} 次，已持续 {elapsed}ms/" +
+                             $"{HandshakeFailureWindowMs}ms，次数上限 {MaxHandshakeFailures}）");
+                    if (failures >= MaxHandshakeFailures ||
+                        (failures >= 3 && elapsed >= HandshakeFailureWindowMs)) {
+                        MarkDisabled($"重连握手失败 {failures} 次、持续 {elapsed}ms");
+                        return;
+                    }
+                    if (AbandonedIoTaskLimitReached) {
+                        MarkDisabled($"被放弃的 IO 任务达到上限 {MaxAbandonedIoTaskCount}");
                         return;
                     }
                 } catch (Exception ex) {
@@ -608,6 +755,11 @@ internal static class Goshujin {
                     } catch {
                         // 关闭过程中的异常无需处理。
                     }
+                    // M2：Connect 失败说明握手序列已中断（宿主不在），重置窗口计数，
+                    // 避免长时间缺宿主后恢复时用陈旧时间戳立刻终态。
+                    Interlocked.Exchange(ref _handshakeFailures, 0);
+                    Volatile.Write(ref _handshakeFailureSinceTicks, 0);
+                    Volatile.Write(ref _lastHandshakeFailureTicks, 0);
                     Log.Trace($"重连尝试失败（累计尝试 {ReconnectAttempts} 次）: {ex.Message}");
                 }
                 if (State == ConnectionState.Disabled) {
@@ -664,6 +816,10 @@ internal static class Goshujin {
         });
         try {
             if (!task.Wait(HandshakeTimeoutMs)) {
+                if (!task.IsCompleted) {
+                    // 握手读可能卡在同步管道 IO 上；计入统一放弃任务数（P1-2）。
+                    TrackAbandonedIoTask(task);
+                }
                 try {
                     stream.Dispose();
                 } catch {

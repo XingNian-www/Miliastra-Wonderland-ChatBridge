@@ -32,11 +32,14 @@ internal static class Program {
             ModeChecks();
             DebugChecks();
             LogSafetyChecks();
+            LogOutputSinkChecks();
             foreach (var scenario in new[]
                      {
                          "queue", "ack", "disconnect", "timeout", "sendstuck", "sendwriteblock",
                          "reconnectbackoff", "reconnecthandshake", "reconnectpassthrough", "reconnectexhaust",
-                         "modereconnect", "debugcapacity", "debugbytes", "debugwritetimeout",
+                         "modereconnect", "controlstale", "abandonedlimit", "handshakewindow", "handshakegap",
+                         "debugrecovery", "abortinit",
+                         "debugcapacity", "debugbytes", "debugwritetimeout",
                      })
                 RunIsolated(scenario);
         } else {
@@ -52,6 +55,12 @@ internal static class Program {
                 case "reconnectpassthrough": ReconnectPassthroughChecks(); break;
                 case "reconnectexhaust": ReconnectExhaustChecks(); break;
                 case "modereconnect": ModeReconnectChecks(); break;
+                case "controlstale": ControlStaleChecks(); break;
+                case "abandonedlimit": AbandonedLimitChecks(); break;
+                case "handshakegap": HandshakeGapChecks(); break;
+                case "handshakewindow": HandshakeWindowChecks(); break;
+                case "debugrecovery": DebugRecoveryChecks(); break;
+                case "abortinit": AbortInitializationChecks(); break;
                 case "debugcapacity": DebugCapacityChecks(); break;
                 case "debugbytes": DebugByteCapChecks(); break;
                 case "debugwritetimeout": DebugWriteTimeoutChecks(); break;
@@ -139,6 +148,35 @@ internal static class Program {
         }
     }
 
+    /// <summary>
+    /// P1-1：生产 Release 不定义 EnableConsoleOutput，_consoleWriter 为 null；此时 WriteLog
+    /// 必须把日志投递到调试器输出（Kernel32!OutputDebugStringW，DebugView 可抓），而不是格式化后丢弃。
+    /// 测试用 OutputSinkForTest 替换实际 P/Invoke，在非 Windows 环境验证格式化/级别/截断/投递；
+    /// Windows 真机端到端步骤见交付说明（DebugView 过滤 [MWC]）。
+    /// </summary>
+    private static void LogOutputSinkChecks() {
+        var captured = new List<string>();
+        Log.OutputSinkForTest = line => captured.Add(line);
+        try {
+            var writeLog = typeof(Log).GetMethod("WriteLog", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)!;
+            writeLog.Invoke(null, new object[] { "debugger sink message", "SinkCheck", LogLevel.Warn });
+            Check(captured.Count == 1, "WriteLog emits one line to the debugger sink when console writer is null");
+            Check(captured[0].StartsWith("[MWC]") && captured[0].Contains("[WARN]") &&
+                  captured[0].Contains("SinkCheck") && captured[0].Contains("debugger sink message"),
+                "debugger line carries MWC prefix, level, tag and message");
+            var huge = new string('x', 5000);
+            writeLog.Invoke(null, new object[] { huge, "SinkCheck", LogLevel.Error });
+            Check(captured.Count == 2 && captured[1].Length < huge.Length,
+                "debugger line body is bounded/truncated for oversized messages");
+            writeLog.Invoke(null, new object[] { "trace line", "SinkCheck", LogLevel.Trace });
+            Check(captured.Count == 3 && captured[2].Contains("[TRACE]"), "trace level is delivered to the debugger sink");
+        } catch (TargetInvocationException ex) {
+            throw new Exception($"WriteLog threw while writing to debugger sink: {ex.InnerException}");
+        } finally {
+            Log.OutputSinkForTest = null;
+        }
+    }
+
     private static void ModeChecks() {
         Check(!ModeControl.AllPackets, "mode control defaults to chat");
         const ushort unknown = 0x7777;
@@ -175,6 +213,10 @@ internal static class Program {
         }
         Check(sink.ToArray().SequenceEqual(new byte[] { 4, 0x34, 0x12, 2, 0, 0, 0, 10, 20 }),
             "debug frame encodes 0x04 + cmd + length + payload");
+        // P2-2：主窗口等待必须有界（60-120s），通过反射读常量避免触发 Native 静态初始化。
+        var waitTimeout = (int) typeof(Native).GetField("DefaultWaitMainWindowMs", Flags)!.GetRawConstantValue()!;
+        Check(waitTimeout >= 60_000 && waitTimeout <= 120_000,
+            "main-window wait timeout is bounded to 60-120 seconds");
     }
 
     // 每个场景单独进程：debug 队列与聊天队列都是单次使用的静态对象。
@@ -234,6 +276,13 @@ internal static class Program {
             Check(!PacketOutbox.Disabled, "debug write timeout leaves the chat outbox enabled");
             Check(sink.Disposed.Wait(WaitMs), "timed-out debug pipe is disposed to unblock the write");
             Check(sink.WriteExited.Wait(WaitMs), "blocked debug frame write exits after disable");
+            // M1：debug 写超时只进入 debug 自己的放弃任务计数，绝不占用聊天阈值。
+            Check(Goshujin.AbandonedDebugIoTaskCount >= 1,
+                "timed-out debug write is counted as a debug abandoned task");
+            Check(Goshujin.AbandonedIoTaskCount == 0,
+                "debug abandoned task does not consume the chat abandoned counter");
+            Check(!Goshujin.AbandonedIoTaskLimitReached,
+                "debug abandoned task cannot trip the chat terminal threshold");
 
             // Disable 之后：直接 Enqueue 与 all 模式钩子都不应该再复制载荷。
             var copiedBefore = DebugOutbox.Copied;
@@ -284,8 +333,42 @@ internal static class Program {
         _decompressResult = true;
         compressed[11] = 0x80;
         Check(InvokeHook(compressed) == 1234 && !Queue.Reader.TryRead(out _), "malformed header stays within callback");
+        // M3：异常包可能每包都走通用 catch；OutputDebugStringW 在 DebugView 下是同步 IPC，
+        // 必须限流（前 5 次 + 每 1024 次），不能在游戏网络线程无限刷。
+        var forwardLogs = new List<string>();
+        Log.OutputSinkForTest = forwardLogs.Add;
+        try {
+            for (var i = 0; i < 10; i++) {
+                Check(InvokeHook(compressed) == 1234 && !Queue.Reader.TryRead(out _),
+                    $"malformed packet {i} stays within callback");
+            }
+        } finally {
+            Log.OutputSinkForTest = null;
+        }
+        Check(forwardLogs.Count(line => line.Contains("Failed to forward packet")) <= 5,
+            "hook-path exception logging is throttled (M3)");
         compressed[11] = 3;
         Check(InvokeHook(compressed) == 1234 && Queue.Reader.TryRead(out _), "valid packet after malformed packet still queues");
+
+        // P1-3：长度不可信时必须丢包，绝不进入无边界解析（否则越界读 AccessViolation 杀游戏）。
+        // m6：测试工程定义 EnableLogging 后，这里验证真实 Log.Warn 调用点（不只是反射 WriteLog 本体）。
+        var invalidLengthLogs = new List<string>();
+        Log.OutputSinkForTest = invalidLengthLogs.Add;
+        try {
+            var invalidLengthBefore = Application.InvalidPacketLengthCount;
+            Check(InvokeHook(packet, packetLengthOverride: 0) == 1234,
+                "invalid native length returns the original value");
+            Check(InvokeHook(packet, packetLengthOverride: 11) == 1234,
+                "too-short native length returns the original value");
+            Check(Application.InvalidPacketLengthCount == invalidLengthBefore + 2,
+                "invalid native lengths are counted");
+            Check(!Queue.Reader.TryRead(out _),
+                "invalid-length packets are dropped without parsing or queueing");
+        } finally {
+            Log.OutputSinkForTest = null;
+        }
+        Check(invalidLengthLogs.Any(line => line.Contains("packetLength 异常")),
+            "invalid length reaches the real EnableLogging callsite");
 
         var capacity = (int) typeof(PacketOutbox).GetField("Capacity", Flags)!.GetRawConstantValue()!;
         Check(capacity == 256, "production queue is bounded at 256 packets");
@@ -376,11 +459,11 @@ internal static class Program {
             Check(!PacketOutbox.Disabled, "hung send no longer permanently disables chat forwarding");
             Check(PacketOutbox.TimeoutCount == 1, "hung send is counted as a timeout");
             Check(ack.ReadCount == 0, "ACK was never consumed before the connection was abandoned");
-            Check(PacketOutbox.AbandonedSendTasks == 1, "at most one send task is abandoned per connection");
+            Check(Goshujin.AbandonedIoTaskCount == 1, "at most one send task is abandoned per connection");
         } finally {
             ack.Release.Set();
             Check(SpinWait.SpinUntil(() => ack.ReadCount > 0, WaitMs), "blocked fake read exits during cleanup");
-            Check(SpinWait.SpinUntil(() => PacketOutbox.AbandonedSendTasks == 0, WaitMs),
+            Check(SpinWait.SpinUntil(() => Goshujin.AbandonedIoTaskCount == 0, WaitMs),
                 "abandoned send task exits after its blocked IO is released");
             PacketOutbox.Disable("regression cleanup");
         }
@@ -411,7 +494,7 @@ internal static class Program {
             Check(SpinWait.SpinUntil(() => Goshujin.State == Goshujin.ConnectionState.Reconnecting, WaitMs),
                 "timed-out send with live IO abandons the connection");
             Check(oldPipe.Disposed, "the stuck pipe is disposed so the blocked IO can abort");
-            Check(PacketOutbox.AbandonedSendTasks == 1, "exactly one send task is abandoned per connection");
+            Check(Goshujin.AbandonedIoTaskCount == 1, "exactly one send task is abandoned per connection");
             Check(Queue.Reader.Count == 1, "no new send task starts while reconnecting (second packet stays queued)");
             Check(!PacketOutbox.Disabled, "reconnecting does not permanently disable forwarding");
 
@@ -426,7 +509,7 @@ internal static class Program {
             Check(PacketOutbox.TimeoutCount >= 1, "hung send was counted as a timeout");
         } finally {
             oldReader.Release.Set();
-            Check(SpinWait.SpinUntil(() => PacketOutbox.AbandonedSendTasks == 0, WaitMs),
+            Check(SpinWait.SpinUntil(() => Goshujin.AbandonedIoTaskCount == 0, WaitMs),
                 "abandoned send task exits once its blocked IO is released");
         }
     }
@@ -457,7 +540,7 @@ internal static class Program {
                 "blocked write times out, abandons the connection and starts reconnecting");
             Check(blocked.Disposed.Wait(WaitMs), "the blocked pipe is disposed so the write can exit");
             Check(blocked.WriteExited.Wait(WaitMs), "the blocked write actually exits after dispose");
-            Check(SpinWait.SpinUntil(() => PacketOutbox.AbandonedSendTasks == 0, WaitMs),
+            Check(SpinWait.SpinUntil(() => Goshujin.AbandonedIoTaskCount == 0, WaitMs),
                 "the abandoned send task exits and releases the old lock");
             Check(Queue.Reader.Count == 1, "no new send task starts while reconnecting");
             Check(!PacketOutbox.Disabled, "blocked write does not permanently disable forwarding");
@@ -563,6 +646,108 @@ internal static class Program {
     }
 
     /// <summary>
+    /// B1 回归：控制管道重连必须对主通道做陈旧判定。
+    /// 新鲜主通道（<10s）连续控制重连不触发主通道回收；陈旧主通道最多触发一次，
+    /// 避免 reattach 竞速下每轮把刚恢复的主通道再关掉、数秒耗尽 3 轮窗口。
+    /// </summary>
+    private static void ControlStaleChecks() {
+        using var ack = new AckStream(block: false);
+        SetPipe(Stream.Null, ack);
+        Goshujin.ConnectStreamForTest = () => throw new IOException("regression: host absent");
+        var triggersBefore = Goshujin.ControlReconnectTriggers;
+
+        // 1) 新鲜主通道：连续 3 次控制重连都不触发（修复前每轮都会触发）。
+        for (var i = 0; i < 3; i++) {
+            Goshujin.SetLastConnectedTicksForTest(Environment.TickCount64);
+            Goshujin.OnControlPipeReconnected();
+            Check(Goshujin.State == Goshujin.ConnectionState.Connected,
+                $"fresh main connection stays connected after control reconnect {i + 1}");
+        }
+        Check(Goshujin.ControlReconnectTriggers == triggersBefore,
+            "fresh main connection never triggers a control-driven main reconnect (B1)");
+
+        // 2) 陈旧主通道：只触发一次；后续控制重连在 Reconnecting 状态不再重复触发。
+        Goshujin.SetLastConnectedTicksForTest(
+            Environment.TickCount64 - Goshujin.ControlReconnectStalenessMs - 1_000);
+        Goshujin.OnControlPipeReconnected();
+        Check(Goshujin.ControlReconnectTriggers == triggersBefore + 1,
+            "stale main connection triggers exactly one main reconnect");
+        Check(Goshujin.State == Goshujin.ConnectionState.Reconnecting,
+            "stale-control trigger puts the main pipe into reconnecting");
+        for (var i = 0; i < 3; i++) {
+            Goshujin.OnControlPipeReconnected();
+        }
+        Check(Goshujin.ControlReconnectTriggers == triggersBefore + 1,
+            "further control reconnects while reconnecting do not retrigger (at most one)");
+
+        // 3) 模拟宿主下一轮：主通道已快速重连成功（新鲜）。后续控制重连不得再触发，
+        //    这正是 B1 自噬链条（关掉刚恢复的主通道 -> 宿主下一轮）的断点。
+        Goshujin.MarkConnectedForTest();
+        for (var i = 0; i < 3; i++) {
+            Goshujin.OnControlPipeReconnected();
+        }
+        Check(Goshujin.ControlReconnectTriggers == triggersBefore + 1,
+            "after a fresh main reconnect, later control rounds do not trigger again (B1)");
+        PacketOutbox.Disable("regression cleanup");
+    }
+
+    /// <summary>
+    /// P1-2/M1 回归：聊天 send+handshake 共用一个放弃任务计数并触发终态；debug 任务只
+    /// 观测、绝不参与聊天阈值（debug 失败不能停掉聊天）。
+    /// </summary>
+    private static void AbandonedLimitChecks() {
+        Check(Goshujin.MaxAbandonedIoTaskCount >= 4 && Goshujin.MaxAbandonedIoTaskCount <= 8,
+            "abandoned IO cap is within the recommended 4-8 range");
+        Check(Goshujin.AbandonedIoTaskCount == 0, "chat abandoned IO counter starts at zero");
+
+        // M1：debug 任务再多也只计入自己的计数，不能触发聊天终态。
+        var debugBlockers = new List<TaskCompletionSource<object?>>();
+        for (var i = 0; i < Goshujin.MaxAbandonedIoTaskCount + 2; i++) {
+            var blocker = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            debugBlockers.Add(blocker);
+            Goshujin.TrackDebugAbandonedIoTask(blocker.Task);
+        }
+        Check(Goshujin.AbandonedDebugIoTaskCount == Goshujin.MaxAbandonedIoTaskCount + 2,
+            "debug abandoned tasks are counted separately");
+        Check(Goshujin.AbandonedIoTaskCount == 0,
+            "debug abandoned tasks do not consume the chat threshold");
+        Check(!Goshujin.AbandonedIoTaskLimitReached,
+            "debug failures cannot trip the chat terminal threshold");
+        foreach (var blocker in debugBlockers) {
+            blocker.SetResult(null);
+        }
+
+        var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Goshujin.TrackAbandonedIoTask(tcs.Task);
+        Check(Goshujin.AbandonedIoTaskCount == 1, "send/handshake tasks share the chat abandoned counter");
+        tcs.SetResult(null);
+        Check(SpinWait.SpinUntil(() => Goshujin.AbandonedIoTaskCount == 0, WaitMs),
+            "completed abandoned task releases its slot");
+
+        var blockers = new List<TaskCompletionSource<object?>>();
+        for (var i = 0; i < Goshujin.MaxAbandonedIoTaskCount; i++) {
+            var blocker = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            blockers.Add(blocker);
+            Goshujin.TrackAbandonedIoTask(blocker.Task);
+        }
+        Check(Goshujin.AbandonedIoTaskCount == Goshujin.MaxAbandonedIoTaskCount,
+            "abandoned IO count reaches the cap");
+        Check(Goshujin.AbandonedIoTaskLimitReached, "cap flag flips at the threshold");
+
+        using var ack = new AckStream(block: false);
+        SetPipe(Stream.Null, ack);
+        Check(!Goshujin.RequestReconnect("regression threshold"),
+            "reconnect is refused once the abandoned IO cap is reached");
+        Check(Goshujin.State == Goshujin.ConnectionState.Disabled,
+            "abandoned IO cap enters a clear terminal state");
+        Check(!Goshujin.RequestReconnect("after terminal"),
+            "terminal state keeps rejecting reconnect");
+        foreach (var blocker in blockers) {
+            blocker.SetResult(null);
+        }
+    }
+
+    /// <summary>
     /// M3 回归：控制管道断开后必须退避重连（而不是永久失联），
     /// 宿主重建管道后重新应用模式；断开期间回落 chat，避免与宿主
     /// /debug/packets 的 dllControl/mode 静默不一致。
@@ -572,7 +757,17 @@ internal static class Program {
         Check(ModeControl.DefaultReconnectMaxDelayMs == 30000, "default control reconnect cap is 30000ms");
         ModeControl.ReconnectInitialDelayMs = 10;
         ModeControl.ReconnectMaxDelayMs = 40;
-        var first = new ModePipeStream([0]);                              // chat，然后 EOF 触发重连
+        // 主通道以"已连接"状态注入，用于验证控制管道重连会主动触发主通道回收（P1-4）。
+        using var ack = new AckStream(block: false);
+        SetPipe(Stream.Null, ack);
+        Goshujin.ReconnectInitialDelayMs = 10;
+        Goshujin.ReconnectMaxDelayMs = 20;
+        Goshujin.ConnectStreamForTest = () => throw new IOException("regression: host absent");
+        // B1：主通道视为"陈旧"（>10s）才允许控制重连触发主通道回收。
+        Goshujin.SetLastConnectedTicksForTest(
+            Environment.TickCount64 - Goshujin.ControlReconnectStalenessMs - 1_000);
+        var triggersBefore = Goshujin.ControlReconnectTriggers;
+        var first = new ModePipeStream([0], blockAfterBytes: true);       // chat，随后 Dispose 模拟宿主断开
         var second = new ModePipeStream([1], blockAfterBytes: true);      // all，然后阻塞（便于观测）
         var calls = 0;
         ModeControl.ConnectStreamForTest = () =>
@@ -581,15 +776,31 @@ internal static class Program {
             Check(!ModeControl.AllPackets, "mode control starts in chat mode");
             ModeControl.Start();
             Check(SpinWait.SpinUntil(() => ModeControl.ConnectCount >= 1, WaitMs), "control pipe connects");
-            Check(SpinWait.SpinUntil(() => first.Disposed, WaitMs), "closed control pipe is disposed");
+            // m5：ConnectCount 会先于状态更新；等一个稳定的观察窗，避免"先读 State"的竞态假绿。
+            Thread.Sleep(100);
+            Check(!ModeControl.AllPackets, "first control pipe applies chat mode");
+            Check(Goshujin.State == Goshujin.ConnectionState.Connected,
+                "initial control connect does not trigger a main pipe reconnect");
+            Check(Goshujin.ControlReconnectTriggers == triggersBefore,
+                "initial control connect leaves the stale-control trigger counter at zero");
+
+            first.Dispose(); // EOF：控制管道断开并重连
             Check(SpinWait.SpinUntil(() => ModeControl.ConnectCount >= 2, WaitMs),
                 "control pipe is re-established after peer close");
             Check(SpinWait.SpinUntil(() => ModeControl.AllPackets, WaitMs),
                 "mode from the reconnected control pipe is applied");
             Check(ModeControl.ReconnectAttempts >= 2, "control reconnect attempts are counted");
+            Check(SpinWait.SpinUntil(() => Goshujin.State == Goshujin.ConnectionState.Reconnecting, WaitMs),
+                "control reconnect triggers a main pipe re-probe");
+            Check(Goshujin.ControlReconnectTriggers == triggersBefore + 1,
+                "stale main connection triggers exactly one control-driven re-probe");
+            Check(SpinWait.SpinUntil(() => Goshujin.ReconnectAttempts >= 1, WaitMs),
+                "main pipe reconnect attempts are counted after the control trigger");
         } finally {
             ModeControl.ConnectStreamForTest = null;
             ModeControl.SetAllPacketsForTest(false);
+            Goshujin.ConnectStreamForTest = null;
+            PacketOutbox.Disable("regression cleanup");
         }
     }
 
@@ -618,24 +829,156 @@ internal static class Program {
         Check(!Goshujin.RequestReconnect("after disable"), "terminal state rejects further reconnect");
     }
 
-    /// <summary>握手连续失败达到上限 -> 终态 Disabled；发送线程据此永久停用（不再反复重连）。</summary>
+    /// <summary>
+    /// 握手失败在时间窗内+次数达标后进入终态；发送线程据此永久停用（不再反复重连）。
+    /// 时间窗用测试值 50ms 缩短（生产默认 5 分钟，覆盖宿主 reattach 3×60s，见 P2-1）。
+    /// </summary>
     private static unsafe void ReconnectExhaustChecks() {
         SetPipe(Stream.Null, new AckStream(block: false));
         Goshujin.ReconnectInitialDelayMs = 10;
         Goshujin.ReconnectMaxDelayMs = 20;
+        Goshujin.HandshakeFailureWindowMs = 50;
         // 空流：握手读立即 EndOfStream，模拟"连上了但协议永远谈不拢"。
         Goshujin.ConnectStreamForTest = () => new FakeHostStream();
         InitializeHook();
         PacketOutbox.Start();
         Check(Goshujin.RequestReconnect("regression"), "reconnect request is accepted");
         Check(SpinWait.SpinUntil(() => Goshujin.State == Goshujin.ConnectionState.Disabled, WaitMs),
-            "consecutive handshake failures enter the terminal disabled state");
-        Check(Goshujin.HandshakeFailures >= Goshujin.MaxHandshakeFailures, "handshake failures reach the cap");
+            "handshake failures within the time window enter the terminal disabled state");
+        Check(Goshujin.HandshakeFailures >= 3, "terminal decision sees at least three handshake failures");
         Check(!Goshujin.RequestReconnect("after terminal"), "terminal state rejects reconnect");
         byte[] packet = [0x45, 0x67, 0, 1, 0, 0, 0, 0, 0, 2, 10, 20, 0x89, 0xAB];
         Check(InvokeHook(packet) == 1234, "hook stays pass-through after terminal reconnect failure");
         Check(SpinWait.SpinUntil(() => PacketOutbox.Disabled, WaitMs),
             "sender observes the terminal state and disables chat forwarding");
+    }
+
+    /// <summary>
+    /// P2-1 回归：3 次快速握手失败不再立刻终态；只有累计时间超过窗口才终态。
+    /// </summary>
+    private static void HandshakeWindowChecks() {
+        Check(Goshujin.DefaultHandshakeFailureWindowMs >= 180_000,
+            "default handshake failure window covers the host 60s x 3 reattach window");
+        Check(Goshujin.MaxHandshakeFailures >= 10, "absolute handshake failure cap is generous");
+        SetPipe(Stream.Null, new AckStream(block: false));
+        Goshujin.ReconnectInitialDelayMs = 10;
+        Goshujin.ReconnectMaxDelayMs = 20;
+        Goshujin.HandshakeFailureWindowMs = 5_000; // 先给足够长的窗口
+        Goshujin.ConnectStreamForTest = () => new FakeHostStream(); // 空流：快速协议失败
+        Check(Goshujin.RequestReconnect("regression"), "reconnect request is accepted");
+        Check(SpinWait.SpinUntil(() => Goshujin.HandshakeFailures >= 3, WaitMs),
+            "handshake failures keep accumulating inside the window");
+        Check(Goshujin.State != Goshujin.ConnectionState.Disabled,
+            "three fast failures alone do not terminate inside the time window");
+        Goshujin.HandshakeFailureWindowMs = Goshujin.MinHandshakeFailureWindowMs;
+        Check(SpinWait.SpinUntil(() => Goshujin.State == Goshujin.ConnectionState.Disabled, WaitMs),
+            "terminal decision happens once the time window elapsed");
+    }
+
+    /// <summary>
+    /// M2 回归：握手时间窗必须是"连续失败"窗口。宿主长时间不在（Connect 失败）后，
+    /// 旧时间戳不能用于第一次恢复就立即终态。
+    /// </summary>
+    private static void HandshakeGapChecks() {
+        SetPipe(Stream.Null, new AckStream(block: false));
+        Goshujin.ReconnectInitialDelayMs = 10;
+        Goshujin.ReconnectMaxDelayMs = 20;
+        Goshujin.HandshakeFailureWindowMs = 5_000;
+        var hostAbsent = 0;
+        var connectCalls = 0;
+        Goshujin.ConnectStreamForTest = () => {
+            Interlocked.Increment(ref connectCalls);
+            if (Volatile.Read(ref hostAbsent) != 0) {
+                throw new IOException("regression: host absent");
+            }
+            return new FakeHostStream(); // 空流：握手立即失败
+        };
+        Check(Goshujin.RequestReconnect("regression"), "reconnect request is accepted");
+        Check(SpinWait.SpinUntil(() => Goshujin.HandshakeFailures >= 2, WaitMs),
+            "two handshake failures recorded before the host disappears");
+        Volatile.Write(ref hostAbsent, 1);
+        var callsAtAbsent = Volatile.Read(ref connectCalls);
+        Check(SpinWait.SpinUntil(() => Volatile.Read(ref connectCalls) >= callsAtAbsent + 2, WaitMs),
+            "connect failures observed while the host is absent");
+        // 模拟旧窗口时间戳：这些握手失败已经过去很久。
+        Goshujin.SetHandshakeFailureSinceTicksForTest(Environment.TickCount64 - 600_000);
+        // 再让一次 Connect 失败：真实实现应在 Connect 失败时重置窗口（旧实现不会）。
+        Check(SpinWait.SpinUntil(() => Volatile.Read(ref connectCalls) >= callsAtAbsent + 3, WaitMs),
+            "another connect failure resets the handshake window");
+        Volatile.Write(ref hostAbsent, 0);
+        Check(SpinWait.SpinUntil(() => Goshujin.HandshakeFailures >= 3, WaitMs),
+            "fresh handshake failures accumulate after the host returns");
+        Check(Goshujin.State != Goshujin.ConnectionState.Disabled,
+            "long connect-failure gap does not terminal on a stale timestamp (M2)");
+    }
+
+    /// <summary>
+    /// P2-4 回归：DebugOutbox 终态 Disable 后可在宿主 reattach（控制管道重连）或
+    /// 控制模式 chat→all 时恢复；恢复后使用新队列/线程，帧编码不变。
+    /// </summary>
+    private static void DebugRecoveryChecks() {
+        DebugOutbox.ConnectStreamForTest = () => throw new IOException("regression: no debug host");
+        DebugOutbox.Start();
+        Check(SpinWait.SpinUntil(() => DebugOutbox.Disabled, WaitMs),
+            "debug disables when its pipe is missing");
+        Check(SpinWait.SpinUntil(() => !DebugOutbox.SenderRunning, WaitMs),
+            "dead debug sender exits before recovery");
+
+        // 触发 1：控制管道重连（模拟宿主 reattach；Goshujin 默认 Disconnected，只走 debug 恢复）。
+        var sink = new MemoryStream();
+        DebugOutbox.ConnectStreamForTest = () => sink;
+        Goshujin.OnControlPipeReconnected();
+        Check(SpinWait.SpinUntil(() => !DebugOutbox.Disabled, WaitMs),
+            "control pipe reattach restarts the debug channel");
+        DebugOutbox.Enqueue(1, [10, 20]);
+        Check(SpinWait.SpinUntil(() => sink.Length >= 9, WaitMs),
+            "recovered debug sender writes frames");
+        Check(sink.ToArray().Take(9).SequenceEqual(new byte[] { 4, 1, 0, 2, 0, 0, 0, 10, 20 }),
+            "recovered debug frame keeps the normal 0x04 encoding");
+        Check(DebugOutbox.RecoveryAttempts == 0,
+            "successful debug recovery resets the consecutive attempt counter");
+
+        // 触发 2：控制模式 chat→all。
+        DebugOutbox.Disable("regression 2");
+        Check(SpinWait.SpinUntil(() => !DebugOutbox.SenderRunning, WaitMs),
+            "disabled debug sender exits before the mode-triggered recovery");
+        var sink2 = new MemoryStream();
+        DebugOutbox.ConnectStreamForTest = () => sink2;
+        ModeControl.SetAllPacketsForTest(false);
+        ModeControl.ApplyMode(1);
+        Check(SpinWait.SpinUntil(() => !DebugOutbox.Disabled, WaitMs),
+            "mode chat->all restarts the debug channel");
+        DebugOutbox.Enqueue(2, [30, 40]);
+        Check(SpinWait.SpinUntil(() => sink2.Length >= 9, WaitMs),
+            "recovered debug sender writes after the mode trigger");
+        Check(DebugOutbox.RecoveryAttempts == 0,
+            "second successful recovery resets the attempt counter");
+        ModeControl.SetAllPacketsForTest(false);
+        DebugOutbox.ConnectStreamForTest = null;
+    }
+
+    /// <summary>
+    /// P2-3 回归：Awake 失败收尾必须关闭主通道（宿主看到 EOF，而不是半活 DLL）并停用转发。
+    /// </summary>
+    private static void AbortInitializationChecks() {
+        using var tracking = new DisposeTrackingStream();
+        using var ack = new AckStream(block: false);
+        SetPipe(Stream.Null, ack);
+        SetPipeField("_pipeStream", tracking);
+        var logs = new List<string>();
+        Log.OutputSinkForTest = logs.Add;
+        try {
+            Application.AbortInitialization("regression abort");
+        } finally {
+            Log.OutputSinkForTest = null;
+        }
+        Check(logs.Any(line => line.Contains("Native initialization failed: regression abort")),
+            "abort initialization reaches the real EnableLogging callsite");
+        Check(PacketOutbox.Disabled, "abort initialization disables forwarding");
+        Check(Goshujin.State == Goshujin.ConnectionState.Disabled,
+            "abort initialization enters the terminal pipe state");
+        Check(tracking.Disposed, "abort initialization disposes the main pipe so the host sees EOF");
+        Check(!Goshujin.RequestReconnect("after abort"), "aborted initialization refuses reconnect");
     }
 
     /// <summary>
@@ -660,11 +1003,11 @@ internal static class Program {
         Application.RequiredPackets.Add(1);
     }
 
-    private static unsafe int InvokeHook(byte[] packet, bool overwriteSource = false) {
+    private static unsafe int InvokeHook(byte[] packet, bool overwriteSource = false, nuint? packetLengthOverride = null) {
         var array = new byte[0x20 + packet.Length];
         packet.CopyTo(array, 0x20);
         fixed (byte* p = array) {
-            *(nuint*) (p + 0x18) = (nuint) packet.Length;
+            *(nuint*) (p + 0x18) = packetLengthOverride ?? (nuint) packet.Length;
             var result = Hook(p, 6);
             if (overwriteSource) array.AsSpan(0x20).Fill(0xCC);
             return result;

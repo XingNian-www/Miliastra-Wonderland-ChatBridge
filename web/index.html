@@ -106,6 +106,10 @@
   #status-game[data-state="connected"]::before { background: var(--ok); }
   #status-game[data-state="disconnected"]::before { background: var(--err); }
   #status-game[data-state="unknown"]::before { background: #64748b; }
+  #status-reattach[data-state="waiting"]::before { background: var(--warn); animation: pulse 1.1s ease-in-out infinite; }
+  #status-reattach[data-state="attached"]::before { background: var(--ok); }
+  #status-reattach[data-state="idle"]::before { background: #64748b; }
+  #status-reattach[data-state="offline"]::before { background: var(--err); }
   #status-hall[data-state="known"]::before { background: var(--accent); }
   #status-hall[data-state="unknown"]::before { background: #64748b; }
   .stat-value { font-variant-numeric: tabular-nums; color: var(--text); }
@@ -165,6 +169,7 @@
   }
   .banner[data-kind="success"] { background: rgba(52, 211, 153, 0.1); border-color: rgba(52, 211, 153, 0.35); color: #a7f3d0; }
   .banner[data-kind="error"] { background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.38); color: #fecaca; }
+  .banner[data-kind="warn"] { background: rgba(251, 191, 36, 0.1); border-color: rgba(251, 191, 36, 0.38); color: #fde68a; }
   .banner[data-kind="info"] { background: rgba(56, 189, 248, 0.1); border-color: rgba(56, 189, 248, 0.35); color: #bae6fd; }
 
   .toolbar {
@@ -430,6 +435,7 @@
   <div class="statusbar" role="group" aria-label="连接与数据源状态">
     <span class="stat"><span class="stat-label">实时</span><span id="status-ws" class="status" data-state="idle">未连接</span><span id="retry-countdown" class="retry" hidden></span></span>
     <span class="stat"><span class="stat-label">游戏</span><span id="status-game" class="status" data-state="unknown">未知</span></span>
+    <span class="stat" hidden><span class="stat-label">链路</span><span id="status-reattach" class="status" data-state="idle" hidden>—</span></span>
     <span class="stat stat-hall"><span class="stat-label">大厅</span><span id="status-hall" class="status" data-state="unknown">未知</span></span>
     <span class="stat"><span class="stat-label">运行</span><span id="status-uptime" class="stat-value">—</span></span>
     <span class="stat"><span class="stat-label">订阅</span><span id="status-subs" class="stat-value">—</span></span>
@@ -486,17 +492,26 @@
   var MAX_MESSAGES = 1000;
   var MAX_DOM_ROWS = 500;
   var MAX_SEEN = 4000;
+  /* 备注档案 LRU 上限：只保留最近活跃的发送者，避免页面开数天后无界增长。 */
+  var MAX_PROFILES = 2000;
+  /* 只刷新最近这么长时间内发过言的 UID；更久以前的档案不再轮询。 */
+  var REMARK_ACTIVE_WINDOW_MS = 10 * 60 * 1000;
   var HEALTH_INTERVAL_MS = 5000;
   var BACKFILL_RETRY_MS = 5000;
   var SUCCESS_BANNER_MS = 4000;
+  /* reattach 默认窗口轮数，用于文案「第 N 轮 / 最多 3 轮」。 */
+  var REATTACH_MAX_ROUNDS = 3;
+  /* 补拉单页最多处理多少条（服务端正常 1000，客户端仍做防御性截断）。 */
+  var MAX_BACKFILL_MESSAGES = 2000;
+  var BACKFILL_RENDER_CHUNK = 50;
   /* 昵称/备注批量查询：去抖后合并成一次请求，避免每条消息都打 /names。 */
   var REMARK_DEBOUNCE_MS = 400;
   var REMARK_BATCH = 100;
   /* 查询失败后的退避：2s 起翻倍，最长 60s；不做“失败即永久放弃”。 */
   var REMARK_RETRY_BASE_MS = 2000;
   var REMARK_RETRY_MAX_MS = 60000;
-  /* 已查到“无备注”的 UID：隔一段时间再问一次，接住服务端后补的备注。 */
-  var REMARK_REFRESH_MS = 30000;
+  /* 成功但无备注：30s -> 5min -> 1h 退避，只对近期活跃 UID 执行。 */
+  var REMARK_REFRESH_STEPS_MS = [30000, 5 * 60 * 1000, 60 * 60 * 1000];
   var WS_LABEL = {
     idle: '未连接',
     connecting: '连接中',
@@ -511,6 +526,7 @@
   var ui = {
     statusWs: byId('status-ws'),
     statusGame: byId('status-game'),
+    statusReattach: byId('status-reattach'),
     statusHall: byId('status-hall'),
     statusUptime: byId('status-uptime'),
     statusSubs: byId('status-subs'),
@@ -569,8 +585,18 @@
   var shownMessages = 0;
   var renderedRows = 0;
   var ignoreScrollUntil = 0;
-  /* uid -> { name, remark }；备注来自 /names 的 remarks，可能晚于消息到达。 */
+  var lastBootId = null;
+  var hostAttachKnown = false;
+  var hostAttached = null;
+  var hostReattachWaiting = false;
+  var hostReattachAttempts = 0;
+  var remarkPaused = false;
+  var remarkRetryAt = 0;
+  var renderScheduled = false;
+  var renderHandle = null;
+  /* uid -> { name, remark, asked, attempts, nextAt, lastSeen, refreshLevel }；备注来自 /names 的 remarks，可能晚于消息到达。 */
   var profiles = Object.create(null);
+  var profileLRU = new Map();
   var pendingUids = Object.create(null);
   var remarkTimer = null;
   var remarkRetryTimer = null;
@@ -583,6 +609,96 @@
   function toNumber(value) {
     var n = Number(value);
     return isFinite(n) ? n : 0;
+  }
+
+  function hasOwn(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  function readBootId(source) {
+    if (!source || typeof source !== 'object') return null;
+    var value = source.bootId;
+    if (value === undefined) value = source.boot_id;
+    if (value === null || value === undefined || value === '') return null;
+    return String(value);
+  }
+
+  function updateReattachStatus() {
+    if (ui.statusReattach.parentNode) ui.statusReattach.parentNode.hidden = !hostAttachKnown;
+    if (!hostAttachKnown) {
+      ui.statusReattach.hidden = true;
+      ui.statusReattach.textContent = '—';
+      ui.statusReattach.setAttribute('data-state', 'idle');
+      ui.statusGame.removeAttribute('title');
+      return;
+    }
+    ui.statusReattach.hidden = false;
+    var rounds = Math.max(1, hostReattachAttempts || 0);
+    if (hostReattachWaiting) {
+      ui.statusReattach.textContent = '恢复链路（第 ' + rounds + ' / ' + REATTACH_MAX_ROUNDS + ' 轮）';
+      ui.statusReattach.setAttribute('data-state', 'waiting');
+      ui.statusGame.title = '宿主尚未接上 DLL；游戏进程可能仍在运行';
+      setBanner('warn', '游戏可能在运行，宿主正在恢复链路（第 ' + rounds + ' 轮 / 最多 ' + REATTACH_MAX_ROUNDS + ' 轮）');
+    } else if (hostAttached === true) {
+      ui.statusReattach.textContent = '已接入';
+      ui.statusReattach.setAttribute('data-state', 'attached');
+      ui.statusGame.removeAttribute('title');
+    } else if (hostAttached === false) {
+      ui.statusReattach.textContent = '未接入';
+      ui.statusReattach.setAttribute('data-state', 'idle');
+      ui.statusGame.title = '宿主尚未接上 DLL';
+    } else {
+      ui.statusReattach.textContent = '—';
+      ui.statusReattach.setAttribute('data-state', 'idle');
+      ui.statusGame.removeAttribute('title');
+    }
+    updateEmptyState();
+  }
+
+  /* 读取 /health 或 hello 里的接入/重连字段；老宿主没有这些字段时保持隐藏并回退旧行为。 */
+  function applyHostAttachFields(source) {
+    if (!source || typeof source !== 'object') return;
+    if (!hasOwn(source, 'attached') && !hasOwn(source, 'reattachWaiting') && !hasOwn(source, 'reattachAttempts')) {
+      return;
+    }
+    var wasWaiting = hostReattachWaiting;
+    hostAttachKnown = true;
+    if (hasOwn(source, 'attached')) {
+      hostAttached = source.attached === true ? true : (source.attached === false ? false : null);
+    }
+    if (hasOwn(source, 'reattachWaiting')) {
+      hostReattachWaiting = source.reattachWaiting === true;
+    }
+    if (hasOwn(source, 'reattachAttempts') && source.reattachAttempts !== null && source.reattachAttempts !== undefined) {
+      hostReattachAttempts = Math.max(0, Math.floor(toNumber(source.reattachAttempts)));
+    }
+    updateReattachStatus();
+    if (wasWaiting && !hostReattachWaiting && hostAttached === true) {
+      setBanner('success', 'DLL 已重新接入，链路恢复');
+    }
+  }
+
+  function requestFrame(callback) {
+    if (typeof window.requestAnimationFrame === 'function') {
+      return window.requestAnimationFrame(callback);
+    }
+    return window.setTimeout(callback, 16);
+  }
+
+  function scheduleRender() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    renderHandle = requestFrame(function () {
+      renderScheduled = false;
+      renderHandle = null;
+      render();
+    });
+  }
+
+  function yieldToBrowser() {
+    return new Promise(function (resolve) {
+      window.setTimeout(resolve, 0);
+    });
   }
 
   function readStoredToken() {
@@ -1059,15 +1175,6 @@
     }
   }
 
-  function detectRestart(serverLast) {
-    var local = toNumber(cursor);
-    if (local > 0 && serverLast < local) {
-      resetSession();
-      return true;
-    }
-    return false;
-  }
-
   function resetSession() {
     messageList = [];
     eventList = [];
@@ -1076,33 +1183,48 @@
     arrivals = [];
     cursor = 0;
     lastServerLastId = 0;
+    lastBootId = null;
     hallKnown = false;
     lastHallKey = null;
+    hostAttachKnown = false;
+    hostAttached = null;
+    hostReattachWaiting = false;
+    hostReattachAttempts = 0;
     setHall(null);
     updateLastId(0);
+    updateReattachStatus();
     /* 备注表跟着重置：桥接重启后服务端缓存也清空，旧备注可能已过时。 */
-    profiles = Object.create(null);
-    pendingUids = Object.create(null);
-    if (remarkTimer) {
-      clearTimeout(remarkTimer);
-      remarkTimer = null;
-    }
-    if (remarkRetryTimer) {
-      clearTimeout(remarkRetryTimer);
-      remarkRetryTimer = null;
-    }
+    clearProfiles();
     addSysEvent('restart', '桥接已重启，消息序号重置');
     updateRate();
   }
 
   function handleHello(event) {
     var helloLast = toNumber(event.lastMessageId);
-    var restarted = detectRestart(helloLast);
-    lastServerLastId = helloLast;
-    updateLastId(helloLast);
+    var helloBoot = readBootId(event);
+    var local = toNumber(cursor);
+    var restarted = false;
+    if (helloBoot !== null && lastBootId !== null) {
+      /* bootId 是权威判据：同一宿主即使水位较小也不清空。 */
+      restarted = helloBoot !== lastBootId;
+    } else if (local > 0 && helloLast < local) {
+      /* 老宿主没有 bootId 时的兼容回退；也覆盖“旧宿主升级到新宿主”的首个带 bootId hello。 */
+      restarted = true;
+    }
     if (restarted) {
+      resetSession();
       setBanner('info', '桥接已重启，已按新序号重新同步');
     }
+    lastBootId = helloBoot;
+    lastServerLastId = helloLast;
+    updateLastId(helloLast);
+    /* 新宿主 hello 可能直接带 attached/reattachWaiting/gameConnected，先刷新一次。 */
+    applyHostAttachFields(event);
+    if (typeof event.gameConnected === 'boolean') {
+      setGame(event.gameConnected);
+      lastGame = event.gameConnected;
+    }
+    syncRemarkPauseState();
     /* 重连/重启后不必等下一个 5s 轮询才刷新游戏与大厅状态 */
     void pollHealth();
     void runBackfill();
@@ -1153,7 +1275,7 @@
     }
     requestProfile(normalized.from.uid, normalized.from.name);
     arrivals.push(Date.now());
-    render();
+    scheduleRender();
   }
 
   function addSysEvent(name, text) {
@@ -1166,7 +1288,7 @@
     if (eventList.length > 200) {
       eventList.splice(0, eventList.length - 200);
     }
-    render();
+    scheduleRender();
   }
 
   function formatClock(ts) {
@@ -1183,15 +1305,32 @@
     return channel === 'private' ? '私聊' : '大厅';
   }
 
-  /* 是否该为这个 UID 发起查询。
-   *
-   * 没问过 → 问；问过但没拿到备注 → 到点再问（接住后补的备注）；
-   * 已经拿到备注 → 不再问。失败不会关掉重试，只是把下次时间往后推。
-   */
+  /* 近期活跃判断：lastSeen 在最近窗口内才值得刷新备注。 */
+  function profileIsActive(entry, now) {
+    return !!entry && (now - entry.lastSeen) <= REMARK_ACTIVE_WINDOW_MS;
+  }
+
+  /* 是否需要为这个 UID 发起查询：不活跃/已有备注/退避未到都不查。 */
   function shouldQueryProfile(entry, now) {
-    if (!entry.asked) return true;
-    if (entry.remark) return false;
-    return now >= entry.nextAt;
+    if (!entry || entry.remark) return false;
+    if (!profileIsActive(entry, now)) return false;
+    return now >= (entry.nextAt || 0);
+  }
+
+  function touchProfile(key) {
+    if (profileLRU.has(key)) profileLRU.delete(key);
+    profileLRU.set(key, true);
+  }
+
+  /* LRU 淘汰：按最近一次消息时间淘汰最旧档案。 */
+  function trimProfiles() {
+    while (profileLRU.size > MAX_PROFILES) {
+      var oldest = profileLRU.keys().next().value;
+      if (oldest === undefined) break;
+      profileLRU.delete(oldest);
+      delete profiles[oldest];
+      delete pendingUids[oldest];
+    }
   }
 
   function requestProfile(uid, fallbackName) {
@@ -1204,6 +1343,8 @@
       if (!known.name && typeof fallbackName === 'string' && fallbackName) {
         known.name = fallbackName;
       }
+      known.lastSeen = now;
+      touchProfile(key);
       if (shouldQueryProfile(known, now) && !pendingUids[key]) {
         pendingUids[key] = true;
         scheduleRemarkFetch();
@@ -1215,13 +1356,23 @@
       remark: null,
       asked: false,
       attempts: 0,
-      nextAt: 0
+      nextAt: 0,
+      lastSeen: now,
+      refreshLevel: 0
     };
+    profileLRU.set(key, true);
+    trimProfiles();
+    if (!profiles[key]) return;
     pendingUids[key] = true;
     scheduleRemarkFetch();
   }
 
+  function remarkPollingPaused() {
+    return unauthorized || bridgeOffline || hostReattachWaiting === true || lastGame === false;
+  }
+
   function scheduleRemarkFetch() {
+    if (!token || unauthorized || remarkPollingPaused()) return;
     if (remarkTimer || remarkInFlight) return;
     remarkTimer = setTimeout(function () {
       remarkTimer = null;
@@ -1229,14 +1380,118 @@
     }, REMARK_DEBOUNCE_MS);
   }
 
+  function clearRemarkRetryTimer() {
+    if (remarkRetryTimer) {
+      clearTimeout(remarkRetryTimer);
+      remarkRetryTimer = null;
+    }
+    remarkRetryAt = 0;
+  }
+
+  function remarkRefreshDelay(level) {
+    var index = Math.min(Math.max(level || 0, 0), REMARK_REFRESH_STEPS_MS.length - 1);
+    return REMARK_REFRESH_STEPS_MS[index];
+  }
+
+  /* 只对近期活跃的无备注档案排下一次刷新；没有候选就清掉 timer。 */
+  function scheduleNextRemark() {
+    if (!token || unauthorized || remarkPollingPaused()) {
+      clearRemarkRetryTimer();
+      return;
+    }
+    var now = Date.now();
+    var keys = Object.keys(profiles);
+    var nextAt = 0;
+    var due = false;
+    for (var i = 0; i < keys.length; i++) {
+      var entry = profiles[keys[i]];
+      if (!entry || entry.remark) continue;
+      if (!profileIsActive(entry, now)) continue;
+      var at = entry.nextAt || 0;
+      if (at <= now) {
+        due = true;
+      } else if (!nextAt || at < nextAt) {
+        nextAt = at;
+      }
+    }
+    /* 已有在途请求/去抖 fetch 会重新调度；这里不再排 0ms timer，避免空转。 */
+    if (due && (remarkInFlight || remarkTimer)) return;
+    var target = due ? now : nextAt;
+    if (!target) {
+      clearRemarkRetryTimer();
+      return;
+    }
+    if (remarkRetryTimer && remarkRetryAt <= target) return;
+    clearRemarkRetryTimer();
+    remarkRetryAt = target;
+    remarkRetryTimer = setTimeout(function () {
+      remarkRetryTimer = null;
+      remarkRetryAt = 0;
+      processRemarkRetry();
+    }, Math.max(0, target - now));
+  }
+
+  function processRemarkRetry() {
+    if (!token || unauthorized || remarkPollingPaused() || remarkInFlight) return;
+    var now = Date.now();
+    var keys = Object.keys(profiles);
+    var queued = false;
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var entry = profiles[key];
+      if (!entry || entry.remark) continue;
+      if (!profileIsActive(entry, now)) continue;
+      if ((entry.nextAt || 0) > now) continue;
+      pendingUids[key] = true;
+      queued = true;
+    }
+    if (queued) scheduleRemarkFetch();
+    scheduleNextRemark();
+  }
+
+  /* gameConnected / reattachWaiting 变化后暂停或恢复备注轮询。 */
+  function syncRemarkPauseState() {
+    var paused = remarkPollingPaused();
+    if (paused && !remarkPaused) {
+      /* 进入暂停：取消待触发的备注刷新，已排队的 pendingUids 留到恢复后再查。 */
+      clearRemarkRetryTimer();
+      if (remarkTimer) {
+        clearTimeout(remarkTimer);
+        remarkTimer = null;
+      }
+    }
+    if (remarkPaused && !paused) {
+      var now = Date.now();
+      var keys = Object.keys(profiles);
+      for (var i = 0; i < keys.length; i++) {
+        var entry = profiles[keys[i]];
+        if (!entry || entry.remark) continue;
+        if (!profileIsActive(entry, now)) continue;
+        if ((entry.nextAt || 0) <= now) pendingUids[keys[i]] = true;
+      }
+      if (Object.keys(pendingUids).length) scheduleRemarkFetch();
+      scheduleNextRemark();
+    }
+    remarkPaused = paused;
+  }
+
+  function clearProfiles() {
+    profiles = Object.create(null);
+    profileLRU = new Map();
+    pendingUids = Object.create(null);
+    if (remarkTimer) {
+      clearTimeout(remarkTimer);
+      remarkTimer = null;
+    }
+    clearRemarkRetryTimer();
+  }
+
   async function fetchRemarks() {
-    if (!token || unauthorized) return;
+    if (!token || unauthorized || remarkPollingPaused()) return;
     var keys = Object.keys(pendingUids);
     if (!keys.length) return;
     pendingUids = Object.create(null);
     remarkInFlight = true;
-    var retryAt = 0;
-    var refreshAt = 0;
     try {
       for (var start = 0; start < keys.length; start += REMARK_BATCH) {
         var batch = keys.slice(start, start + REMARK_BATCH);
@@ -1258,15 +1513,13 @@
           var entry = profiles[uidKey];
           if (!entry) continue;
           if (!ok) {
-            /* 失败：累加退避，下一次到点再问；绝不永久放弃。 */
+            /* 失败：指数退避，之后 scheduleNextRemark 重新排；不永久放弃。 */
+            entry.asked = true;
             entry.attempts = (entry.attempts || 0) + 1;
-            var backoff = Math.min(
+            entry.nextAt = now + Math.min(
               REMARK_RETRY_BASE_MS * Math.pow(2, entry.attempts - 1),
               REMARK_RETRY_MAX_MS
             );
-            entry.asked = false;
-            entry.nextAt = now + backoff;
-            retryAt = retryAt ? Math.min(retryAt, entry.nextAt) : entry.nextAt;
             continue;
           }
           var name = names[uidKey];
@@ -1275,7 +1528,6 @@
             entry.name = name;
             changed = true;
           }
-          /* 没设备注时服务端不返回该键，保持 null。 */
           var nextRemark = typeof remark === 'string' && remark ? remark : null;
           if (nextRemark !== entry.remark) {
             entry.remark = nextRemark;
@@ -1283,23 +1535,23 @@
           }
           entry.asked = true;
           entry.attempts = 0;
-          /* 没有备注的条目：过一段时间再问，接住服务端后补的备注。
-           * 这里必须主动排一个刷新定时器——否则只有新消息才能触发，
-           * 而大厅安静时可能很久没有该 UID 的新消息。 */
-          entry.nextAt = nextRemark ? 0 : now + REMARK_REFRESH_MS;
-          if (!nextRemark) {
-            refreshAt = refreshAt ? Math.min(refreshAt, entry.nextAt) : entry.nextAt;
+          if (nextRemark) {
+            entry.nextAt = 0;
+            entry.refreshLevel = 0;
+          } else {
+            var level = entry.refreshLevel || 0;
+            entry.nextAt = now + remarkRefreshDelay(level);
+            entry.refreshLevel = Math.min(level + 1, REMARK_REFRESH_STEPS_MS.length - 1);
           }
         }
-        if (changed) render();
+        if (changed) scheduleRender();
       }
     } catch (err) {
-      /* 备注是增强信息，失败不影响消息展示；下次消息到达会再试。 */
       var failNow = Date.now();
-      var pendingKeys = keys.slice();
-      for (var k = 0; k < pendingKeys.length; k++) {
-        var failed = profiles[pendingKeys[k]];
+      for (var k = 0; k < keys.length; k++) {
+        var failed = profiles[keys[k]];
         if (!failed || failed.remark) continue;
+        failed.asked = true;
         failed.attempts = (failed.attempts || 0) + 1;
         failed.nextAt = failNow + Math.min(
           REMARK_RETRY_BASE_MS * Math.pow(2, failed.attempts - 1),
@@ -1308,31 +1560,9 @@
       }
     } finally {
       remarkInFlight = false;
-      if (retryAt) scheduleRemarkRetry(retryAt);
-      if (refreshAt) scheduleRemarkRetry(refreshAt);
-      if (Object.keys(pendingUids).length) scheduleRemarkFetch();
+      if (!remarkPollingPaused() && Object.keys(pendingUids).length) scheduleRemarkFetch();
+      scheduleNextRemark();
     }
-  }
-
-  /* 失败退避：到点重试，且只重试仍缺备注的 UID。 */
-  function scheduleRemarkRetry(at) {
-    if (remarkRetryTimer) return;
-    var delay = Math.max(0, at - Date.now());
-    remarkRetryTimer = setTimeout(function () {
-      remarkRetryTimer = null;
-      if (!token || unauthorized) return;
-      var now = Date.now();
-      var keys = Object.keys(profiles);
-      var queued = false;
-      for (var i = 0; i < keys.length; i++) {
-        var entry = profiles[keys[i]];
-        if (!entry || entry.remark) continue;
-        if (!shouldQueryProfile(entry, now)) continue;
-        pendingUids[keys[i]] = true;
-        queued = true;
-      }
-      if (queued) scheduleRemarkFetch();
-    }, delay);
   }
 
   /* 消息发送者最终显示的名字：消息自带的昵称优先，其次用 /names 回填的昵称。 */
@@ -1420,7 +1650,16 @@
     if (!show) return;
     if (noMessages) {
       ui.emptyTitle.textContent = '等待检测到消息…';
-      ui.emptyHint.textContent = '请确认游戏已启动且注入成功。';
+      if (bridgeOffline) {
+        ui.emptyHint.textContent = '桥接离线，正在等待恢复…';
+      } else if (hostReattachWaiting) {
+        var rounds = Math.max(1, hostReattachAttempts || 0);
+        ui.emptyHint.textContent = '游戏可能在运行，宿主正在恢复链路（第 ' + rounds + ' 轮 / 最多 ' + REATTACH_MAX_ROUNDS + ' 轮）…';
+      } else if (hostAttachKnown && hostAttached === false) {
+        ui.emptyHint.textContent = '宿主尚未接上 DLL，请确认游戏与注入状态。';
+      } else {
+        ui.emptyHint.textContent = '请确认游戏已启动且注入成功。';
+      }
     } else {
       ui.emptyTitle.textContent = '没有匹配的消息';
       ui.emptyHint.textContent = '调整频道或搜索关键词后重试。';
@@ -1508,7 +1747,8 @@
     eventSeq = 0;
     seenIds = new Set();
     arrivals = [];
-    render();
+    clearProfiles();
+    scheduleRender();
     updateRate();
   }
 
@@ -1557,7 +1797,7 @@
         }
         if (result.status === 503) {
           lastBackfillFailed = true;
-          setBanner('error', '游戏未连接，等待注入恢复');
+          if (!hostReattachWaiting) setBanner('error', '游戏未连接，等待注入恢复');
           scheduleBackfillRetry();
           return;
         }
@@ -1572,8 +1812,12 @@
           truncatedShown = true;
           addSysEvent('truncated', '部分历史消息已被淘汰');
         }
-        var list = Array.isArray(data.messages) ? data.messages : [];
-        for (var i = 0; i < list.length; i++) processMessage(list[i]);
+        /* 客户端防御：即使服务端异常返回超大数组，也只处理有限条并分片让出主线程。 */
+        var list = Array.isArray(data.messages) ? data.messages.slice(0, MAX_BACKFILL_MESSAGES) : [];
+        for (var i = 0; i < list.length; i++) {
+          processMessage(list[i]);
+          if ((i + 1) % BACKFILL_RENDER_CHUNK === 0) await yieldToBrowser();
+        }
         var reported = data.lastMessageId === undefined || data.lastMessageId === null
           ? null
           : toNumber(data.lastMessageId);
@@ -1625,6 +1869,7 @@
     applyWsState();
     showSetup('令牌无效，请检查后重新输入。');
     setBanner('error', '令牌无效，实时连接已停止');
+    syncRemarkPauseState();
   }
 
   function handleHealthUnreachable() {
@@ -1635,7 +1880,19 @@
     ui.statusUptime.textContent = '—';
     ui.statusUptime.removeAttribute('title');
     ui.statusSubs.textContent = '—';
-    setBanner('error', '桥接离线，正在等待恢复…');
+    ui.statusGame.removeAttribute('title');
+    if (hostAttachKnown) {
+      ui.statusReattach.hidden = false;
+      ui.statusReattach.textContent = '宿主离线';
+      ui.statusReattach.setAttribute('data-state', 'offline');
+    }
+    if (hostAttachKnown && hostReattachAttempts >= REATTACH_MAX_ROUNDS) {
+      setBanner('error', '宿主已离线，且已多次尝试恢复链路；游戏若仍在运行，可能需要重启游戏。');
+    } else {
+      setBanner('error', '桥接离线，正在等待恢复…');
+    }
+    updateEmptyState();
+    syncRemarkPauseState();
     applyWsState();
     if ((!socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING)
       && !reconnectTimer) {
@@ -1646,14 +1903,17 @@
   function applyHealth(data) {
     var recovered = bridgeOffline;
     bridgeOffline = false;
+    /* 先消费宿主新增的 attached/reattachWaiting/reattachAttempts；老宿主缺字段时函数内部自动回退。 */
+    applyHostAttachFields(data);
     var game = data.gameConnected;
     var gameConnected = game === true ? true : (game === false ? false : null);
     var previousGame = lastGame;
     setGame(gameConnected);
     lastGame = gameConnected;
     if (gameConnected === false) {
-      setBanner('error', '游戏未连接，等待注入恢复');
-    } else if (gameConnected === true && previousGame === false) {
+      /* reattach 等待期间 gameConnected=false 是预期状态，不再误导成“游戏未连接”。 */
+      if (!hostReattachWaiting) setBanner('error', '游戏未连接，等待注入恢复');
+    } else if (gameConnected === true && previousGame === false && !hostReattachWaiting) {
       setBanner('success', '游戏已连接');
     }
 
@@ -1661,18 +1921,11 @@
     else updateUptime(null);
     ui.statusSubs.textContent = typeof data.subscribers === 'number' ? String(data.subscribers) : '—';
 
+    /* 重启判定只发生在 WS hello（bootId/lastMessageId）；/health 的 lastMessageId 只用于展示，不触发清空。 */
     if (data.lastMessageId !== undefined && data.lastMessageId !== null) {
       var reported = toNumber(data.lastMessageId);
-      var restarted = detectRestart(reported);
-      if (restarted) {
-        lastServerLastId = reported;
-        updateLastId(reported);
-        setBanner('info', '桥接已重启，已按新序号重新同步');
-        void runBackfill();
-      } else {
-        if (reported > lastServerLastId) lastServerLastId = reported;
-        updateLastId(Math.max(lastServerLastId, toNumber(cursor)));
-      }
+      if (reported > lastServerLastId) lastServerLastId = reported;
+      updateLastId(Math.max(lastServerLastId, toNumber(cursor)));
     }
 
     if (Object.prototype.hasOwnProperty.call(data, 'currentHall')) {
@@ -1680,13 +1933,15 @@
     }
 
     if (recovered) {
-      if (gameConnected !== false) setBanner('success', '桥接已恢复');
+      if (!hostReattachWaiting && gameConnected !== false) setBanner('success', '桥接已恢复');
       ensureConnect();
     }
-    if (gameConnected === true && backfillTimer) {
+    if (gameConnected === true && !hostReattachWaiting && backfillTimer) {
       clearBackfillRetry();
       void runBackfill();
     }
+    updateReattachStatus();
+    syncRemarkPauseState();
     applyWsState();
   }
 
@@ -1723,6 +1978,7 @@
     applyWsState();
     pollHealth();
     ensureConnect();
+    syncRemarkPauseState();
     if (!rateTimer) {
       rateTimer = setInterval(updateRate, 1000);
     }
@@ -1792,8 +2048,8 @@
         try { ui.btnSettings.focus(); } catch (err) { /* 忽略 */ }
       }
     });
-    ui.filterChannel.addEventListener('change', render);
-    ui.filterText.addEventListener('input', render);
+    ui.filterChannel.addEventListener('change', scheduleRender);
+    ui.filterText.addEventListener('input', scheduleRender);
     ui.follow.addEventListener('change', function () {
       if (ui.follow.checked) scrollToBottom();
     });
@@ -1820,6 +2076,7 @@
     setHall(null);
     updateUptime(null);
     updateLastId(0);
+    updateReattachStatus();
     ui.statusSubs.textContent = '—';
     bindEvents();
     render();

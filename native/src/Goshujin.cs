@@ -381,6 +381,7 @@ internal static class Goshujin {
     private static long _lastConnectedTicks;
     private static int _abandonedIoTaskCount;
     private static int _abandonedDebugIoTaskCount;
+    private static int _peakAbandonedDebugIoTaskCount;
     private static long _controlReconnectTriggers;
     private static int _handshakeFailureWindowMs = DefaultHandshakeFailureWindowMs;
 
@@ -415,10 +416,18 @@ internal static class Goshujin {
     internal static int AbandonedIoTaskCount => Volatile.Read(ref _abandonedIoTaskCount);
 
     /// <summary>
-    /// 被放弃的 debug IO 任务数。与聊天计数完全隔离：debug 写超时绝不能让聊天终态，
-    /// 这是"debug 失败不影响聊天"的红线（M1）。
+    /// 被放弃的 debug IO 任务数（当前值）。与聊天计数完全隔离：debug 写超时绝不能让
+    /// 聊天终态，这是"debug 失败不影响聊天"的红线（M1）。
     /// </summary>
     internal static int AbandonedDebugIoTaskCount => Volatile.Read(ref _abandonedDebugIoTaskCount);
+
+    /// <summary>
+    /// 被放弃 debug IO 任务数的历史峰值。用于"确实被记为放弃任务"的断言：
+    /// Windows 上 Disable 可能立刻解除阻塞写，Task 很快完成并把当前值减回 0，
+    /// 只看当前值会产生时序竞态；峰值对 Task 何时退出免疫。
+    /// </summary>
+    internal static int PeakAbandonedDebugIoTaskCount =>
+        Volatile.Read(ref _peakAbandonedDebugIoTaskCount);
 
     /// <summary>是否已达到 <see cref="MaxAbandonedIoTaskCount"/> 聊天兜底阈值。</summary>
     internal static bool AbandonedIoTaskLimitReached =>
@@ -446,8 +455,20 @@ internal static class Goshujin {
     /// debug 通道自身已经会 Disable，聊天继续按自己的健康状态工作。
     /// </summary>
     internal static void TrackDebugAbandonedIoTask(Task task) {
-        Interlocked.Increment(ref _abandonedDebugIoTaskCount);
+        var count = Interlocked.Increment(ref _abandonedDebugIoTaskCount);
+        UpdatePeak(ref _peakAbandonedDebugIoTaskCount, count);
         _ = task.ContinueWith(_ => Interlocked.Decrement(ref _abandonedDebugIoTaskCount), TaskScheduler.Default);
+    }
+
+    private static void UpdatePeak(ref int peak, int value) {
+        var current = Volatile.Read(ref peak);
+        while (value > current) {
+            var prior = Interlocked.CompareExchange(ref peak, value, current);
+            if (prior == current) {
+                return;
+            }
+            current = prior;
+        }
     }
 
     /// <summary>回归测试用：直接设置上次成功连接时刻，构造"新鲜/陈旧"主通道场景。</summary>

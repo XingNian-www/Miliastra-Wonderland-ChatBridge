@@ -277,8 +277,10 @@ internal static class Program {
             Check(sink.Disposed.Wait(WaitMs), "timed-out debug pipe is disposed to unblock the write");
             Check(sink.WriteExited.Wait(WaitMs), "blocked debug frame write exits after disable");
             // M1：debug 写超时只进入 debug 自己的放弃任务计数，绝不占用聊天阈值。
-            Check(Goshujin.AbandonedDebugIoTaskCount >= 1,
-                "timed-out debug write is counted as a debug abandoned task");
+            // Windows 上 Disable 可能立刻解除阻塞写，Task 随即完成并把当前计数减回 0；
+            // 用历史峰值断言"这次超时确实被记为放弃任务"，对完成时序免疫（CI 抓到的竞态）。
+            Check(Goshujin.PeakAbandonedDebugIoTaskCount >= 1,
+                "timed-out debug write was recorded as a debug abandoned task (peak)");
             Check(Goshujin.AbandonedIoTaskCount == 0,
                 "debug abandoned task does not consume the chat abandoned counter");
             Check(!Goshujin.AbandonedIoTaskLimitReached,
@@ -701,14 +703,24 @@ internal static class Program {
         Check(Goshujin.AbandonedIoTaskCount == 0, "chat abandoned IO counter starts at zero");
 
         // M1：debug 任务再多也只计入自己的计数，不能触发聊天终态。
+        // 峰值语义对时序免疫：即使 Task 立刻完成、当前计数马上回落，峰值仍能证明它被记过。
+        var debugPeakBefore = Goshujin.PeakAbandonedDebugIoTaskCount;
+        Goshujin.TrackDebugAbandonedIoTask(Task.CompletedTask);
+        Check(Goshujin.PeakAbandonedDebugIoTaskCount > debugPeakBefore,
+            "peak captures an already-completed abandoned debug task");
+        Check(SpinWait.SpinUntil(() => Goshujin.AbandonedDebugIoTaskCount == 0, WaitMs),
+            "completed debug task releases the current abandoned slot");
+
         var debugBlockers = new List<TaskCompletionSource<object?>>();
         for (var i = 0; i < Goshujin.MaxAbandonedIoTaskCount + 2; i++) {
             var blocker = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
             debugBlockers.Add(blocker);
             Goshujin.TrackDebugAbandonedIoTask(blocker.Task);
         }
+        Check(Goshujin.PeakAbandonedDebugIoTaskCount >= Goshujin.MaxAbandonedIoTaskCount + 2,
+            "debug abandoned tasks are recorded separately (peak)");
         Check(Goshujin.AbandonedDebugIoTaskCount == Goshujin.MaxAbandonedIoTaskCount + 2,
-            "debug abandoned tasks are counted separately");
+            "debug blockers stay incomplete so the current count is stable");
         Check(Goshujin.AbandonedIoTaskCount == 0,
             "debug abandoned tasks do not consume the chat threshold");
         Check(!Goshujin.AbandonedIoTaskLimitReached,

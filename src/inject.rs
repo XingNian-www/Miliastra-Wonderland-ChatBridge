@@ -101,7 +101,7 @@ pub async fn run(
 ///
 /// 为什么需要它：DLL 的发送线程一次只写一个包并等宿主回执，收到回执后才写下一包。
 /// 宿主旧实现回执后立刻 Peek，此时下一包通常还没写进来，于是**每个包**都要吃一次
-/// `poll_pause()`（50ms）。千星大厅里 2246 信封的速率约 20 包/秒，正好卡在这个
+/// `poll_pause()`（50ms）。千星大厅里聊天信封的速率约 20 包/秒，正好卡在这个
 /// 吞吐上限附近；一旦超过，DLL 侧 256 容量的发送队列就会积满：
 ///
 ///   256 包 × 50ms ≈ 12.8s 固定积压
@@ -1998,7 +1998,7 @@ fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
     );
     let _ = cmd;
     tracing::debug!(
-        "2246 解析: hall={:?} names={} pop={:?} chats={} profiles={}",
+        "信封解析: hall={:?} names={} pop={:?} chats={} profiles={}",
         halls,
         names.len(),
         population,

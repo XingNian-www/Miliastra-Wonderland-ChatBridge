@@ -218,14 +218,12 @@ fn run() -> Result<()> {
         .game_config
         .clone()
         .unwrap_or_else(game_config::default_cache_path);
+    // 只有显式 --game-config-url 才锁定单一地址；否则交给 resolve 走多源回退
+    // （之前在这里 unwrap_or 成固定 URL，把 REMOTE_CANDIDATES 整条链路绕过了）。
     let remote_url = if args.no_remote_config {
         None
     } else {
-        Some(
-            args.game_config_url
-                .as_deref()
-                .unwrap_or(game_config::DEFAULT_REMOTE_URL),
-        )
+        args.game_config_url.as_deref()
     };
     let resolved = game_config::resolve(
         &game_cfg_path,

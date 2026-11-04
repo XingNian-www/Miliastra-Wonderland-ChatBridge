@@ -182,7 +182,8 @@ protobuf 字段号**。它们以前分散在代码与 `metadata.bin` 里，现�
 
 ```
 INFO  已读取游戏配置缓存: game-config.json（1 个版本，1 套布局）
-WARN  拉取远程游戏配置失败，降级: GET https://raw.githubusercontent.com/... 失败: 404
+WARN  拉取远程游戏配置失败，尝试下一个源: GET https://ghfast.top/... 失败: timeout: global
+INFO  已获取远程游戏配置: https://ghfast.top/...（1 个版本，1 套布局，updatedAt=2026-11-04T04:30:00Z）
 INFO  游戏配置来源: 本地缓存（1 个版本，1 套布局，信封 cmdId [24007]）
 ```
 
@@ -237,7 +238,18 @@ INFO  游戏配置来源: 本地缓存（1 个版本，1 套布局，信封 cmdI
 | `--dump-game-config` | 打印内置默认配置后退出（用于重新生成仓库里的那份） |
 | `--cmd <ids>` | 临时覆盖信封 cmdId，优先级高于配置文件 |
 
-远程地址固定为仓库里的 `config/game-config.json`：
+远程配置在仓库里的 `config/game-config.json`，按**从快到慢**依次尝试，第一个成功即用：
+
+| 顺序 | 源 | 说明 |
+|---|---|---|
+| 1 | `https://ghfast.top/https://raw.githubusercontent.com/…` | 国内可直连，实测约 2.3s |
+| 2 | `https://raw.githubusercontent.com/…` | 直连，无第三方依赖，但国内实测 19~21s |
+| 3 | `https://cdn.jsdelivr.net/gh/…@master/…` | CDN 兜底，按分支缓存约 12h，可能拿到旧表 |
+
+直连放第二位而不是第一位：它国内常要 20 秒，会明显拖慢启动；但必须留在候选里，
+否则代理挂掉就没有可用源。成功时日志会打出实际来源与 `updatedAt`，便于发现拿到的是旧表。
+
+原始直连地址：
 
 ```
 https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/master/config/game-config.json

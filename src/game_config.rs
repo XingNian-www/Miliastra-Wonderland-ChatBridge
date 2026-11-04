@@ -38,8 +38,25 @@ pub const SCHEMA: &str = "miliastra-chatbridge-game-config/v1";
 /// 默认的远程配置地址（仓库里的 config/game-config.json）。
 pub const DEFAULT_REMOTE_URL: &str = "https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/master/config/game-config.json";
 
+/// 远程配置的候选源，**按快慢排序**，逐个尝试、第一个成功即用。
+///
+/// 为什么不只用 GitHub 直连：国内访问 " + BT*0 + "raw.githubusercontent.com" + " 实测 19~21 秒，
+/// 且首次请求常常 30 秒超时；而桥在启动时同步拉取，等这么久会明显拖慢启动。
+/// 实测（游戏机 192.168.31.119）：ghfast 代理约 2.3s、jsDelivr 约 3.1s、直连 19~21s。
+///
+/// jsDelivr 放最后：它按分支缓存（@master 约 12 小时），可能拿到旧表，
+/// 只在前面两个都失败时兜底，且日志会打出实际来源与 updatedAt，便于发现拿到的是旧表。
+pub const REMOTE_CANDIDATES: &[&str] = &[
+    // 与 git 的 url.insteadOf 用的是同一个代理，国内可直连。
+    "https://ghfast.top/https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/master/config/game-config.json",
+    // 直连，慢但无第三方依赖。
+    DEFAULT_REMOTE_URL,
+    // CDN 兜底，可能滞后。
+    "https://cdn.jsdelivr.net/gh/XingNian-www/Miliastra-Wonderland-ChatBridge@master/config/game-config.json",
+];
+
 /// 远程拉取的硬超时。抓不到就降级，不能让启动卡住。
-pub const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 一份游戏版本配置。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -402,41 +419,52 @@ pub fn resolve(
         None
     };
 
-    if allow_remote && let Some(url) = remote_url {
-        match fetch(url) {
-            Ok(remote) => {
-                // 时间戳不倒退：远程比缓存旧时拒绝覆盖，防止 CDN 回源冲掉新表。
-                let accept = match (&cached, &remote.updated_at) {
-                    (Some(cache), Some(remote_ts)) => match &cache.updated_at {
-                        Some(cache_ts) => remote_ts >= cache_ts,
-                        None => true,
-                    },
-                    _ => true,
-                };
-                if accept {
-                    log(&format!(
-                        "已获取远程游戏配置: {}（{} 个版本，{} 套布局）",
-                        url,
-                        remote.versions.len(),
-                        remote.layouts.len()
-                    ));
-                    // 写缓存失败不影响本次运行。
-                    if let Ok(text) = remote.to_json()
-                        && let Some(parent) = cache_path.parent()
-                    {
-                        let _ = std::fs::create_dir_all(parent);
-                        if let Err(error) = std::fs::write(cache_path, text) {
-                            log(&format!("写游戏配置缓存失败（不影响运行）: {error}"));
-                        }
-                    }
-                    return Resolved {
-                        config: remote,
-                        source: Source::Remote,
-                    };
+    if allow_remote {
+        // 显式地址（--game-config-url）只试那一个；否则按 REMOTE_CANDIDATES 顺序逐个试。
+        let candidates: Vec<&str> = match remote_url {
+            Some(url) => vec![url],
+            None => REMOTE_CANDIDATES.to_vec(),
+        };
+        for url in candidates {
+            let remote = match fetch(url) {
+                Ok(remote) => remote,
+                Err(error) => {
+                    log(&format!("拉取远程游戏配置失败，尝试下一个源: {error:#}"));
+                    continue;
                 }
-                log("远程游戏配置比本地缓存旧，拒绝覆盖");
+            };
+            // 时间戳不倒退：远程比缓存旧时拒绝覆盖，防止 CDN 回源冲掉新表。
+            let accept = match (&cached, &remote.updated_at) {
+                (Some(cache), Some(remote_ts)) => match &cache.updated_at {
+                    Some(cache_ts) => remote_ts >= cache_ts,
+                    None => true,
+                },
+                _ => true,
+            };
+            if !accept {
+                log(&format!("远程游戏配置比本地缓存旧，拒绝覆盖: {url}"));
+                continue;
             }
-            Err(error) => log(&format!("拉取远程游戏配置失败，降级: {error:#}")),
+            log(&format!(
+                "已获取远程游戏配置: {}（{} 个版本，{} 套布局，updatedAt={}）",
+                url,
+                remote.versions.len(),
+                remote.layouts.len(),
+                remote.updated_at.as_deref().unwrap_or("-")
+            ));
+            // 写缓存失败不影响本次运行。
+            if let Ok(text) = remote.to_json()
+                && let Some(parent) = cache_path.parent()
+            {
+                let _ = std::fs::create_dir_all(parent);
+                if let Err(error) = std::fs::write(cache_path, text) {
+                    log(&format!("写游戏配置缓存失败（不影响运行）: {error}"));
+                }
+            }
+            return Resolved {
+                config: remote,
+                source: Source::Remote,
+            };
         }
     }
 
@@ -462,6 +490,10 @@ pub fn fetch(url: &str) -> Result<GameConfig> {
         "远程配置地址必须是 https://（实际 {url}）"
     );
     let mut response = ureq::get(url)
+        .config()
+        .timeout_global(Some(FETCH_TIMEOUT))
+        .user_agent(concat!("miliastra-chatbridge/", env!("CARGO_PKG_VERSION")))
+        .build()
         .call()
         .with_context(|| format!("GET {url} 失败"))?;
     let text = response
@@ -620,5 +652,24 @@ mod tests {
     fn remote_must_be_https() {
         let error = fetch("http://example.com/game-config.json").expect_err("http 必须拒绝");
         assert!(format!("{error:#}").contains("https"));
+    }
+    #[test]
+    fn remote_candidates_are_https_and_direct_is_last_resort() {
+        assert!(!REMOTE_CANDIDATES.is_empty());
+        for url in REMOTE_CANDIDATES {
+            assert!(url.starts_with("https://"), "候选源必须 https: {url}");
+        }
+        assert!(
+            REMOTE_CANDIDATES.contains(&DEFAULT_REMOTE_URL),
+            "直连 GitHub 必须留在候选里，否则代理全挂时无源可用"
+        );
+        let direct = REMOTE_CANDIDATES
+            .iter()
+            .position(|u| *u == DEFAULT_REMOTE_URL)
+            .expect("直连存在");
+        assert!(
+            direct > 0,
+            "直连在国内实测 19~21 秒，不能排在第一个（会拖慢启动）"
+        );
     }
 }

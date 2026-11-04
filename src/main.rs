@@ -22,6 +22,7 @@ mod server;
 mod state;
 
 mod exit_code;
+mod game_config;
 mod game_path;
 #[cfg(windows)]
 mod inject;
@@ -191,6 +192,12 @@ fn run() -> Result<()> {
     if let Some(path) = log_file.as_deref() {
         tracing::info!("日志文件: {}", path.display());
     }
+    if args.dump_game_config {
+        // 导出内置默认配置：既方便用户对比，也用于重新生成仓库里的 config/game-config.json。
+        println!("{}", game_config::default_config().to_json()?);
+        return Ok(());
+    }
+
     let path = args.config.clone();
     let cfg = config::load(
         &path,
@@ -205,8 +212,46 @@ fn run() -> Result<()> {
         cfg.port,
         cfg.self_uid
     );
+    // 游戏版本配置：RVA 表 / 信封 cmdId / 包体布局都在这里。
+    // 顺序是「远程 -> 本地缓存 -> 内置默认」；任何一步失败都只降级，不阻塞启动。
+    let game_cfg_path = args
+        .game_config
+        .clone()
+        .unwrap_or_else(game_config::default_cache_path);
+    let remote_url = if args.no_remote_config {
+        None
+    } else {
+        Some(
+            args.game_config_url
+                .as_deref()
+                .unwrap_or(game_config::DEFAULT_REMOTE_URL),
+        )
+    };
+    let resolved = game_config::resolve(
+        &game_cfg_path,
+        remote_url,
+        !args.no_remote_config,
+        &mut |line| {
+            if line.contains("失败") || line.contains("无效") || line.contains("拒绝") {
+                tracing::warn!("{line}");
+            } else {
+                tracing::info!("{line}");
+            }
+        },
+    );
+    tracing::info!(
+        "游戏配置来源: {}（{} 个版本，{} 套布局，信封 cmdId {:?}）",
+        resolved.source.as_str(),
+        resolved.config.versions.len(),
+        resolved.config.layouts.len(),
+        resolved.config.envelope
+    );
+    // 先装配置再装布局：wanted_cmds 在未给 --cmd 时会读配置里的 envelope。
+    extract::install_layouts(resolved.config.layouts.clone());
+    game_config::install(resolved.config.clone());
+
     if args.diagnose {
-        return diagnose(&cfg, args.game_path.as_deref());
+        return diagnose(&cfg, args.game_path.as_deref(), &args.wanted_cmds);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -229,6 +274,10 @@ fn run() -> Result<()> {
                 max_bytes: args.capture_max_mib.saturating_mul(1024 * 1024),
             }),
     );
+    if args.no_auto_capture {
+        packets.set_auto_capture(false);
+        tracing::info!("已关闭「切 ALL 自动抓包」：需要抓包请调 POST /debug/capture");
+    }
     if let Some(dir) = args.capture_dir.as_deref() {
         tracing::info!(
             "raw 抓包目录: {}（debug 模式收到全包后写入；每次启动重建 index.csv）",
@@ -261,9 +310,13 @@ fn run() -> Result<()> {
     let result = runtime.block_on(async move {
         // 先成功绑定 HTTP，端口冲突时绝不创建游戏进程。
         let port = cfg.port;
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await
-            .with_context(|| format!("监听 127.0.0.1:{port} 失败"))?;
-        tracing::info!("HTTP/WS 服务已启动: http://127.0.0.1:{port}（bootId={boot_id}）");
+        // 默认只听环回；需要局域网访问时用 CHATBRIDGE_BIND=0.0.0.0 显式放开。
+        let bind_addr =
+            std::env::var("CHATBRIDGE_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
+        let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), port))
+            .await
+            .with_context(|| format!("监听 {bind_addr}:{port} 失败"))?;
+        tracing::info!("HTTP/WS 服务已启动: http://{bind_addr}:{port}（bootId={boot_id}）");
         let serve = async { axum::serve(listener, server::router(app)).await.context("HTTP 服务异常退出") };
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
@@ -274,7 +327,7 @@ fn run() -> Result<()> {
             let dll_health = Arc::clone(&dll_health);
             async move {
                 if !args.auto_launch { return std::future::pending::<Result<()>>().await; }
-                inject::run(chat, connected, Arc::clone(&packets), Arc::clone(&session), dll_health, args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), reattach_window, cancelled).await
+                inject::run(chat, connected, Arc::clone(&packets), Arc::clone(&session), dll_health, args.auto_launch, args.spawn_only, args.lib_only, args.game_path.clone(), reattach_window, cancelled, args.wanted_cmds.clone()).await
             }
         };
         #[cfg(not(windows))]
@@ -481,7 +534,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeWriter {
 /// 启动前自检：在拉起游戏之前把"环境不对"暴露出来。
 ///
 /// 只读文件 + 占用一次端口做冲突检测；不启动游戏、不注入、不改任何状态。
-fn diagnose(cfg: &config::Config, game_path: Option<&std::path::Path>) -> Result<()> {
+fn diagnose(
+    cfg: &config::Config,
+    game_path: Option<&std::path::Path>,
+    cfg_wanted_cmds: &[u16],
+) -> Result<()> {
     use std::path::PathBuf;
 
     // 只有 Windows 的自检会用游戏路径做校验；其它平台避免 unused 警告。
@@ -565,6 +622,33 @@ fn diagnose(cfg: &config::Config, game_path: Option<&std::path::Path>) -> Result
     if failures > 0 {
         anyhow::bail!("自检失败 {failures} 项");
     }
+    // 订阅表是游戏更新后最容易失效的一环：把生效值打出来，
+    // 配合 --cmd 就能不重新编译地修正。
+    let effective = crate::extract::wanted_cmds(cfg_wanted_cmds);
+    let ids = effective
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("  [INFO] 订阅 cmdId: {ids}（游戏改版后用 --cmd 覆盖，例如 --cmd 24007,486）");
+    let active = crate::game_config::active();
+    let crcs = active
+        .versions
+        .iter()
+        .map(|v| format!("{}:0x{}", v.game_version, v.exe_crc32))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "  [INFO] 游戏配置: {} 个版本（{crcs}），{} 套包体布局（{}）",
+        active.versions.len(),
+        active.layouts.len(),
+        active
+            .layouts
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect::<Vec<_>>()
+            .join("/")
+    );
     println!("自检通过。");
     Ok(())
 }
@@ -590,11 +674,15 @@ fn game_check(
         let read = file.read(&mut head)?;
         head.truncate(read);
         let crc = crate::metadata::game_crc32(&head);
+        // 与 resolve_rva 同序：配置优先，metadata.bin 兜底。
+        if let Some(rva) = crate::game_config::active().rva_for_crc(crc) {
+            return Ok((crc, rva.is_valid()));
+        }
         let bytes = std::fs::read(metadata_path).context("读取 metadata.bin 失败")?;
         let metadata = crate::metadata::Metadata::parse(&bytes)?;
-        let rva = metadata
-            .for_game(crc)
-            .with_context(|| format!("metadata 里没有 CRC32=0x{crc:08x} 的 RVA 表"))?;
+        let rva = metadata.for_game(crc).with_context(|| {
+            format!("既没有游戏配置也没有 metadata 里 CRC32=0x{crc:08x} 的 RVA 表")
+        })?;
         Ok((crc, rva.is_valid()))
     })();
     match check {
@@ -614,6 +702,29 @@ fn game_check(
         ),
         Err(error) => (false, format!("游戏 exe 检查失败: {error:#}")),
     }
+}
+
+/// 解析 "24007,486" 这样的 cmdId 列表。
+///
+/// 空项与重复项都被忽略；任一项不是合法 u16 就报错，避免静默订阅到错误编号。
+pub fn parse_cmd_list(value: &str) -> anyhow::Result<Vec<u16>> {
+    let mut out: Vec<u16> = Vec::new();
+    for piece in value.split(',') {
+        let trimmed = piece.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let id: u16 = trimmed
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--cmd 里的 {trimmed} 不是 0..=65535 的数字"))?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("--cmd 至少要给一个 cmdId");
+    }
+    Ok(out)
 }
 
 /// 极简参数解析：只支持 --config 与 --self-uid。
@@ -661,6 +772,20 @@ mod clap_free_args {
         /// MAX_REATTACH_ROUNDS 轮，总等待上限约为 轮数 × 该值。
         /// 0 表示禁用 reattach：游戏已在运行时沿用旧行为，直接以退出码 3 结束。
         pub reattach_seconds: u64,
+        /// 游戏配置文件路径（默认程序同目录的 game-config.json）。
+        pub game_config: Option<PathBuf>,
+        /// 远程游戏配置 URL；None 表示用内置默认地址。
+        pub game_config_url: Option<String>,
+        /// 禁用在线获取，只用本地缓存与内置默认。
+        pub no_remote_config: bool,
+        /// 切到 ALL 模式时不自动开抓包（默认会按程序目录下的 capture/ 自动开）。
+        pub no_auto_capture: bool,
+        /// 打印内置默认的游戏配置后退出（用于重新生成 config/game-config.json）。
+        pub dump_game_config: bool,
+        /// 订阅 cmdId 覆盖（--cmd 24007,486）。空表示用编译期默认。
+        ///
+        /// 游戏大版本更新常会改聊天信封的 cmdId；有了这个参数就不必重新编译。
+        pub wanted_cmds: Vec<u16>,
     }
 
     impl Args {
@@ -680,6 +805,12 @@ mod clap_free_args {
             let mut capture_max_mib = 1024u64;
             let mut game_path: Option<PathBuf> = None;
             let mut reattach_seconds = super::DEFAULT_REATTACH_WINDOW_SECS;
+            let mut wanted_cmds: Vec<u16> = Vec::new();
+            let mut game_config: Option<PathBuf> = None;
+            let mut game_config_url: Option<String> = None;
+            let mut no_remote_config = false;
+            let mut dump_game_config = false;
+            let mut no_auto_capture = false;
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--config" => {
@@ -701,6 +832,21 @@ mod clap_free_args {
                     "--token" => {
                         token = Some(args.next().context("--token 需要参数")?);
                     }
+                    "--cmd" => {
+                        let value = args.next().context("--cmd 需要参数（如 24007,486）")?;
+                        wanted_cmds = super::parse_cmd_list(&value)?;
+                    }
+                    "--game-config" => {
+                        game_config = Some(PathBuf::from(
+                            args.next().context("--game-config 需要路径参数")?,
+                        ));
+                    }
+                    "--game-config-url" => {
+                        game_config_url = Some(args.next().context("--game-config-url 需要 URL")?);
+                    }
+                    "--no-remote-config" => no_remote_config = true,
+                    "--dump-game-config" => dump_game_config = true,
+                    "--no-auto-capture" => no_auto_capture = true,
                     "--log-file" => {
                         log_file = Some(PathBuf::from(
                             args.next().context("--log-file 需要路径参数")?,
@@ -739,7 +885,7 @@ mod clap_free_args {
                     }
                     "--help" | "-h" => {
                         println!(
-                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--game-path <exe|dir>] [--reattach-seconds <n>] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
+                            "用法: Miliastra-Wonderland-ChatBridge [--config <path>] [--self-uid <uid>] [--port <n>] [--token <s>] [--log-file <path> | --no-log-file] [--game-path <exe|dir>] [--reattach-seconds <n>] [--cmd <id[,id...]>] [--game-config <path>] [--game-config-url <url>] [--no-remote-config] [--dump-game-config] [--no-auto-capture] [--no-launch] [--spawn-only] [--lib-only] [--diagnose] [--debug-packets] [--capture-dir <path>] [--capture-max-mib <n>] [--version]"
                         );
                         println!(
                             "  --reattach-seconds: 每轮等待 DLL 重连的窗口，默认 {}s；0=禁用 reattach。最多 {} 轮，总等待上限约 {}s",
@@ -769,6 +915,12 @@ mod clap_free_args {
                 capture_max_mib,
                 game_path,
                 reattach_seconds,
+                wanted_cmds,
+                game_config,
+                game_config_url,
+                no_remote_config,
+                dump_game_config,
+                no_auto_capture,
             })
         }
     }

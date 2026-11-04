@@ -61,6 +61,40 @@ reattach 的安全边界是**只建管道、只等待**：绝不 `CreateProcess`
 - 默认 reattach 开启时，游戏已在运行不会再返回 `3`；`3` 只用于关闭 reattach 的兼容路径。
 - 退出码 `4` 不是「可以立刻自动重启宿主」的信号：默认策略已经等过最多 3 轮窗口。优先让玩家重启游戏；只有确认旧 DLL 仍在重连时，重拉宿主才有恢复意义。
 
+
+### 抓包（ALL 模式）
+
+抓包不再需要重启进程。切到 ALL 会自动在**程序同目录的 `capture/`** 下开始落盘：
+
+```bash
+# 一行切 ALL，顺便自动开抓包
+curl -X POST http://127.0.0.1:18889/debug/packets \
+  -H 'x-miliastra-token: <token>' -H 'Content-Type: application/json' \
+  -d '{"mode":"all"}'
+→ {"ok":true,"mode":"all","applied":true,"captureDir":"...\\capture","captureActive":true}
+```
+
+单独控制抓包（换目录、停止、恢复）：
+
+```bash
+# 状态
+curl http://127.0.0.1:18889/debug/capture -H 'x-miliastra-token: <token>'
+# 开（dir 省略 = 默认目录；maxMib 省略 = 512 MiB）
+curl -X POST http://127.0.0.1:18889/debug/capture \
+  -H 'x-miliastra-token: <token>' -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"dir":"D:/caps","maxMib":256}'
+# 停（落盘线程退出，已抓的文件保留）
+curl -X POST http://127.0.0.1:18889/debug/capture \
+  -H 'x-miliastra-token: <token>' -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+```
+
+仍然支持启动参数 `--capture-dir <path> --capture-max-mib <n>`（开机就抓）；
+不想要「切 ALL 自动抓」的行为就加 `--no-auto-capture`。
+
+落盘格式不变：`p_<seq>_<cmd>_<len>.bin` + `index.csv`。
+注意自动抓包会**截断**目标目录里上一次的 `index.csv`；要保留旧数据请先挪走。
+
 ## 诊断
 
 被 Music 以隐藏窗口拉起时，stdout 进 NUL，控制台什么也看不到。为此提供四类观测手段：
@@ -129,6 +163,201 @@ miliastra-wonderland-chatbridge --port 18889 --token <令牌> --self-uid <UID> \
 落盘文件名形如 `p_00042_02246_137.bin`（序号、cmd、payload 长度），`index.csv` 逐行 `seq,cmd,len,unixMillis`；文件内容是与游戏嗅探一致的原始 protobuf payload，不含管道帧头。每次启动只重建 `index.csv`，不会清理目录里上一次留下的 `p_*.bin`；复用目录前请先清空，避免新旧文件混在一起。
 
 注意：全包模式会把**所有**能抓到的包（包含非聊天、可能含账号/环境信息）写入磁盘与 debug 管道，只建议在内网、可信环境短期开启；`captures/` 目录不要外传，用完及时删除。debug 走独立管道，即使它断开或写盘失败，聊天通道也照常工作；但全包模式会让游戏的网络解包线程对每个包多一次解压/复制，属于重诊断模式，长期开启有性能代价，用完请切回 `chat`。
+
+
+
+## 游戏版本配置（game-config.json）
+
+游戏每次大版本更新会同时改三样东西：**exe 的 RVA 偏移**、**信封 cmdId**、**聊天包体的
+protobuf 字段号**。它们以前分散在代码与 `metadata.bin` 里，现在统一外置成一份 JSON，
+**更新游戏后只要改这份文件，不用重新编译**。
+
+### 加载顺序
+
+```
+远程 URL  ->  本地缓存 game-config.json  ->  编译内置默认
+```
+
+任何一步失败都只降一级，不影响启动：
+
+```
+INFO  已读取游戏配置缓存: game-config.json（2 个版本，2 套布局）
+WARN  拉取远程游戏配置失败，降级: GET https://raw.githubusercontent.com/... 失败: 404
+INFO  游戏配置来源: 本地缓存（2 个版本，2 套布局，信封 cmdId [24007, 486]）
+```
+
+### 文件内容
+
+```json
+{
+  "schema": "miliastra-chatbridge-game-config/v1",
+  "updatedAt": "2026-11-04T04:30:00Z",
+  "envelope": [24007, 486],
+  "versions": [
+    {
+      "gameVersion": "7.2.0",
+      "exeCrc32": "8cb60f3d",
+      "rva": {
+        "toInt32": "0x19b541a0",
+        "tcpStatePtr": "0x0586d7e0",
+        "sharedInfoPtr": "0x0586d7e8",
+        "decompress": "0x06f0f970",
+        "updateNormalProp": "0x12178db0"
+      }
+    }
+  ],
+  "layouts": [
+    {
+      "id": "7.2",
+      "events": 12, "innerType": 2, "payload": 14,
+      "bodyHall": 5, "bodyPrivate": 5,
+      "ts": 2, "fromUid": 1, "toUid": 6, "text": 630,
+      "hallCtx": 4, "hallType": 1, "hallId": 2, "populationHall": 2,
+      "innerHallChat": 29636, "innerPrivateChat": 25574
+    }
+  ]
+}
+```
+
+- `versions[].exeCrc32`：游戏 exe **前 64 KiB** 的 CRC32（8 位十六进制，大小写与 `0x` 前缀都可）。
+- `versions[].rva`：注入用的函数偏移。**写成十六进制字符串**，与 IDA/Ghidra 里看到的一致；
+  反序列化也接受十进制数字，方便脚本生成。
+- `envelope`：要订阅的信封 cmdId（`--cmd` 优先级更高）。
+- `layouts`：聊天包体字段号，**按新到旧排列**，解析时逐套尝试、命中即用，所以新旧版本可以共存。
+  尚未识别的内层事件类型省略或写 `null`，对应功能会优雅降级为返回空。
+
+### 命令行
+
+| 参数 | 作用 |
+|---|---|
+| `--game-config <path>` | 指定配置文件（默认程序同目录 `game-config.json`） |
+| `--game-config-url <url>` | 覆盖远程地址（必须是 `https://`） |
+| `--no-remote-config` | 禁用在线获取，只用本地缓存与内置默认 |
+| `--dump-game-config` | 打印内置默认配置后退出（用于重新生成仓库里的那份） |
+| `--cmd <ids>` | 临时覆盖信封 cmdId，优先级高于配置文件 |
+
+远程地址固定为仓库里的 `config/game-config.json`：
+
+```
+https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/master/config/game-config.json
+```
+
+### 安全边界
+
+这份配置决定往游戏进程里挂钩子的地址，填错会让 DLL 挂到错误位置，所以：
+
+- 远程地址**只接受 `https://`**，避免明文被中间人篡改；
+- `schema` 必须匹配，未知版本整份拒绝；
+- `deny_unknown_fields`：字段名拼错会直接报错，而不是静默用默认值唬人；
+- **时间戳不倒退**：远程 `updatedAt` 比本地缓存旧时拒绝覆盖，防止 CDN 回源到旧文件
+  把新表冲掉；
+- 每次运行 `--diagnose` 都会打印最终生效的来源与版本列表，便于核对。
+
+### 更新游戏后的操作
+
+1. `--diagnose` 看 `游戏 exe: ...（CRC32=0x????????）`，记下新的 CRC32；
+2. 按「游戏大版本更新后的修复顺序」那节定位新的 RVA 与字段号；
+3. 把新条目**追加**到 `versions` / `layouts` 前面，更新 `updatedAt`；
+4. 推到仓库的 `config/game-config.json`；各机器下次启动自动拉取，无需重装。
+
+> **关键区别**：私聊有两个事件，`28274` 是**实时单条**（一条消息一个包），
+> `25574` 是**整段会话快照**（实测一次 20 条、每 60 秒一轮）。
+> 只有前者能保证实时性；把快照当实时会同时带来「最多 60 秒延迟」和「重复推送」。
+
+## 游戏大版本更新后的修复顺序
+
+游戏每次大版本更新会同时动三处：**exe 的 RVA 表**、**信封 cmdId**、**protobuf 字段号**。
+三者互相独立，按下面的顺序排查最快——每一层都有对应的低成本修法。
+
+### 1. RVA 表（metadata.bin）
+
+游戏 exe 变了，`metadata.bin` 里的 `CRC32 -> RVA` 表就对不上，注入会在最早期失败。
+
+```powershell
+.\miliastra-wonderland-chatbridge.exe --diagnose --no-log-file --port 18999 --token t --self-uid 1
+```
+
+看这一行：
+
+```
+[OK] 游戏 exe: ...\YuanShen.exe（CRC32=0x8cb60f3d，RVA 表完整）
+```
+
+若报 `metadata 里没有 CRC32=0x... 的 RVA 表`，说明这张表缺这个版本。
+定位方法（已验证可用）：
+
+- 拿**上一版 exe** 与新版 exe 同目录对比；
+- 目标函数（`to_int32` / `decompress` / `update_normal_prop`）在 il2cpp 段内，
+  取上一版函数的首部若干字节做特征串，在新版里搜；
+- `tcp_state_ptr` / `shared_info_ptr` 是 **BSS 数据变量**，文件里没有初始值，
+  只能靠**引用它们的指令上下文**定位：在上一版找到 `mov rcx,[rip+d]` / `mov rdx,[rip+d]`
+  这对相邻指令，连同前后各若干字节做特征，在新版里搜到唯一位置后，
+  用 RIP 相对寻址反算目标地址（两处独立引用必须得到同一结果才可信）。
+
+### 2. 信封 cmdId
+
+聊天数据挂在某个 `cmdId` 上，这个号也会变（7.1 是 `2246`，7.2 是 `24007`）。
+
+先用 `--diagnose` 看当前生效值：
+
+```
+[INFO] 订阅 cmdId: 24007,486（游戏改版后用 --cmd 覆盖，例如 --cmd 24007,486）
+```
+
+然后用全包模式看实际收到什么：
+
+```bash
+curl -X POST http://127.0.0.1:18889/debug/packets \
+  -H 'x-miliastra-token: <token>' -H 'Content-Type: application/json' \
+  -d '{"mode":"all"}'
+```
+
+`/debug/packets` 的 `counts.cmds` 会列出各 cmdId 的包数；发包量最大那个、
+且**发一条聊天消息时计数会跳**的就是新的信封 cmd。
+
+**不需要重新编译**：直接加参数覆盖即可。
+
+```
+--cmd 24007,486
+```
+
+### 3. protobuf 字段号
+
+信封内部的字段号同样会整体换掉。代码把差异集中成数据（`src/extract.rs` 里的 `Layout`），
+解析时按 `LAYOUTS` 顺序**逐套尝试，命中即用**，所以新旧版本可以同时支持。
+
+| 项 | 7.1 | 7.2 |
+|---|---|---|
+| 事件列表 | `#8` | `#12` |
+| 内层类型 | `#13` | `#2` |
+| 载荷 | `#6` | `#14` |
+| 消息体（大厅） | `#4` | `#5` |
+| 消息体（私聊，实时） | `#8` | `#4` |
+| 文本 | `#1985` | `#630` |
+| 发送者 UID | `#5` | `#1` |
+| 时间戳 | `#1` | `#2` |
+| 私聊目标 UID | `#9` | `#6` |
+| 大厅上下文 | `#15` | `#4` |
+| 内层：大厅聊天 | `20415` | `29636` |
+| 内层：私聊**实时** | `486` | `28274` |
+| 内层：私聊**会话快照**（忽略） | `28347` | `25574` |
+| 内层：好友列表 | `4410` | `29281` |
+| 好友记录列表 / uid / 昵称 / 备注 | `#15` / `#1` / `#2` / `#17` | `#10` / `#1` / `#2` / `#17` |
+| 内层：大厅成员 | `2076` | `29039`（记录 `#13`，uid `#9`，昵称 `#3`） |
+| 内层：大厅 id 补充 | `7154`（载荷 `#9`） | `7470`（载荷 `#5`） |
+
+
+确认新字段号的办法：把 `dispatch` 里的临时诊断打开（打印顶层字段号 + 内层类型 + 完整 hex），
+发一条消息，在日志里找**包含明文文本的那段 hex**——文本字段号的 tag 就在它前面
+（`#630` 的 tag 是 `b2 27`）。
+
+拿到全部字段号后，在 `LAYOUTS` **前面**加一条 `LAYOUT_7_3` 即可，其余代码不用动。
+
+### 4. 回归测试
+
+`src/extract.rs` 的 `extract_72_*` 用例用的是**真机抓到的包**做字节级锚点。
+版本变更时照样子加一组 `extract_73_*`，把新抓包钉进去——
+这样下次再变，测试会立刻指出是哪一层坏了。
 
 ## 许可与致谢
 

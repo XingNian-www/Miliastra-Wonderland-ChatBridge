@@ -24,6 +24,50 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// "我在哪个大厅"时就先排掉公共频道，减少噪音与误判。
 pub const PUBLIC_CHANNEL_HALL_TYPE: u32 = 23;
 
+/// 历史消息的容忍窗口（秒）。
+///
+/// 登录时游戏会把私聊历史用**实时事件**（7.2 的 25574）一次性重放一遍，
+/// 协议里没有「这是历史」的标记，只能靠时间戳区分。实测重放消息的 ts 比当前时间
+/// 早几分钟到几小时，而真正的实时消息 ts 就是当前时间，所以按这个窗口切开。
+///
+/// 代价：断线期间积压、且延迟超过该窗口的消息会被丢弃。对聊天机器人来说这是对的取舍
+/// —— 重放会把历史命令再执行一遍，比漏一条旧消息危险得多。
+pub const STALE_GRACE_SECS: i64 = 120;
+
+/// 去重窗口长度（条数）。
+///
+/// 游戏会**周期性重放**整段私聊（实测每 60 秒一次、一次 18 条），
+/// 其中「刚发出不久」的消息仍在 STALE_GRACE_SECS 之内，会重复通过时间戳过滤。
+/// 所以再按 (发送者, 时间戳, 文本) 做一层去重。
+const RECENT_LIMIT: usize = 1024;
+
+/// 当前 Unix 时间（秒）。
+/// 当前 Unix 时间（秒），测试里给消息打时间戳用。
+#[cfg(test)]
+pub(crate) fn now_unix_secs() -> u64 {
+    unix_now().max(1) as u64
+}
+
+/// 消息指纹：发送者 + 时间戳 + 文本的哈希。
+///
+/// 只用来压重放，不参与业务判断；哈希冲突最多误丢一条，代价可接受。
+fn message_fingerprint(raw: &RawChat) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw.from_uid.hash(&mut hasher);
+    raw.ts.hash(&mut hasher);
+    raw.text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 当前 Unix 时间（秒）。
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// ingest 期间收集的待打印日志。
 ///
 /// 为什么不在写锁内直接 `tracing::info!`：`TeeWriter` 是同步文件 IO，
@@ -42,6 +86,10 @@ enum IngestLog {
     HallFollow { hall_id: u64, hall_type: u32 },
     /// 已推送的消息。
     Dispatch { index: usize, channel: Channel },
+    /// 历史重放：时间戳早于容忍窗口，直接丢弃。
+    Stale { index: usize, ts: i64 },
+    /// 周期性重放导致的重复消息，已发过同样的。
+    Duplicate { index: usize },
 }
 
 impl IngestLog {
@@ -66,6 +114,21 @@ impl IngestLog {
             }
             Self::HallFollow { hall_id, hall_type } => {
                 tracing::info!("跟随消息切换当前大厅: {hall_id} type={hall_type}");
+            }
+            Self::Duplicate { index } => {
+                tracing::info!(
+                    "[丢弃-重复] from={} text={:?}",
+                    raws[*index].from_uid,
+                    raws[*index].text
+                );
+            }
+            Self::Stale { index, ts } => {
+                let raw = &raws[*index];
+                tracing::info!(
+                    "[丢弃-历史重放] ts={ts} from={} text={:?}",
+                    raw.from_uid,
+                    raw.text
+                );
             }
             Self::Dispatch { index, channel } => {
                 let raw = &raws[*index];
@@ -104,6 +167,11 @@ struct Inner {
     /// 4410 在进游戏时全量下发一次，之后只有懒加载增量；协议里没有快照/增量
     /// 标记字段，所以只能按时序区分：第一次收到的当全量基线，之后都当增量合并。
     friend_list_seen: bool,
+    /// 早于这个时间戳的消息一律当历史重放丢弃。进程启动时定一次。
+    accepted_after: i64,
+    /// 最近发过的消息指纹，用于压掉周期性重放。
+    recent: VecDeque<u64>,
+    recent_set: std::collections::HashSet<u64>,
 }
 
 impl ChatState {
@@ -118,6 +186,9 @@ impl ChatState {
                 remarks: BTreeMap::new(),
                 last_id: 0,
                 friend_list_seen: false,
+                accepted_after: unix_now() - STALE_GRACE_SECS,
+                recent: VecDeque::new(),
+                recent_set: std::collections::HashSet::new(),
             }),
             tx,
             self_uid,
@@ -208,13 +279,22 @@ impl ChatState {
         let oldest = inner.messages.front().map(|m| m.id).unwrap_or(0);
         // 请求区间早于缓冲起点，说明中间有遗漏。
         let truncated = since.saturating_add(1) < oldest;
-        let messages: Vec<_> = inner
+        let mut messages: Vec<_> = inner
             .messages
             .iter()
             .filter(|m| m.id > since)
             .take(limit)
             .cloned()
             .collect();
+        // 名字在读取时补：好友列表/成员列表可能比消息晚到（桥重启后尤其明显），
+        // 入库时查不到名字的消息，不该永远显示 uid。
+        for message in &mut messages {
+            if message.from.name.is_none()
+                && let Some(name) = inner.names.get(&message.from.uid)
+            {
+                message.from.name = Some(name.clone());
+            }
+        }
         (messages, inner.last_id, truncated)
     }
 
@@ -232,7 +312,26 @@ impl ChatState {
         let mut events = Vec::new();
         // 锁内只记下标与小字段：不含 String，不做 format，不做任何 IO。
         let mut logs = Vec::new();
+        // 历史重放过滤：见 STALE_GRACE_SECS 的说明。
+        let now_secs = unix_now();
         for (index, raw) in raws.iter().enumerate() {
+            let ts = i64::try_from(raw.ts).unwrap_or(i64::MAX);
+            if ts > 0 && ts < now_secs - STALE_GRACE_SECS {
+                logs.push(IngestLog::Stale { index, ts });
+                continue;
+            }
+            // 周期性重放压重：同一 (发送者, 时间戳, 文本) 只放行一次。
+            let fingerprint = message_fingerprint(raw);
+            if !inner.recent_set.insert(fingerprint) {
+                logs.push(IngestLog::Duplicate { index });
+                continue;
+            }
+            inner.recent.push_back(fingerprint);
+            if inner.recent.len() > RECENT_LIMIT
+                && let Some(expired) = inner.recent.pop_front()
+            {
+                inner.recent_set.remove(&expired);
+            }
             // 包括自己发言在内，公共频道都不能影响当前大厅。
             if !raw.is_private && raw.hall_type == Some(PUBLIC_CHANNEL_HALL_TYPE) {
                 logs.push(IngestLog::PublicDiscard { index });
@@ -337,7 +436,7 @@ mod tests {
 
     fn raw(text: &str, from: u32, hall: Option<u64>, private: bool) -> RawChat {
         RawChat {
-            ts: 100,
+            ts: unix_now().max(1) as u64,
             from_uid: from,
             to_uid: None,
             text: text.into(),
@@ -345,6 +444,79 @@ mod tests {
             hall_type: hall.map(|_| 16),
             is_private: private,
         }
+    }
+
+    #[tokio::test]
+    async fn stale_history_burst_is_dropped() {
+        // 7.2 登录时会把私聊历史用实时事件一次性重放（实测 20 条，ts 早几十分钟）。
+        // 这些消息必须丢弃：否则历史里的 @命令 会被重新执行一遍。
+        let chat = ChatState::new(1);
+        let now = unix_now();
+        let stale = RawChat {
+            ts: (now - STALE_GRACE_SECS - 60) as u64,
+            ..raw("旧命令", 2, None, true)
+        };
+        let fresh = RawChat {
+            ts: now as u64,
+            ..raw("新消息", 2, None, true)
+        };
+        chat.ingest(vec![stale, fresh]).await;
+        let messages = chat.messages_since(0, 10).await.0;
+        assert_eq!(messages.len(), 1, "历史重放应被丢弃，只留实时消息");
+        assert_eq!(messages[0].text, "新消息");
+    }
+
+    #[tokio::test]
+    async fn late_name_backfills_existing_messages() {
+        // 桥重启后好友列表可能比消息晚到二十来秒；名字应在读取时补上，
+        // 而不是让早期消息永远只有 uid。
+        let chat = ChatState::new(1);
+        chat.ingest(vec![raw("先到的消息", 100000002, None, true)])
+            .await;
+        let before = chat.messages_since(0, 10).await.0;
+        assert_eq!(before[0].from.name, None, "此时还没有名字");
+
+        chat.record_names(vec![(100000002, "玩家甲".to_owned())])
+            .await;
+
+        let after = chat.messages_since(0, 10).await.0;
+        assert_eq!(after[0].from.name.as_deref(), Some("玩家甲"), "名字应回填");
+        assert_eq!(after[0].text, "先到的消息", "消息本体不受影响");
+    }
+
+    #[tokio::test]
+    async fn periodic_replay_does_not_duplicate() {
+        // 游戏每 60 秒重放一次整段私聊，最近的消息仍在时间窗口内，必须靠指纹压掉。
+        let chat = ChatState::new(1);
+        let msg = raw("111", 100000001, None, true);
+        chat.ingest(vec![msg.clone(), msg.clone(), msg]).await;
+        let messages = chat.messages_since(0, 10).await.0;
+        assert_eq!(messages.len(), 1, "同一条重放三次只能推一次");
+        assert_eq!(messages[0].text, "111");
+    }
+
+    #[tokio::test]
+    async fn same_text_new_timestamp_is_not_a_duplicate() {
+        // 同一句话隔一会儿又说一遍，是两条独立消息，不能当成重放。
+        let chat = ChatState::new(1);
+        let first = raw("111", 100000001, None, true);
+        let mut second = raw("111", 100000001, None, true);
+        second.ts = first.ts + 5;
+        chat.ingest(vec![first, second]).await;
+        assert_eq!(chat.messages_since(0, 10).await.0.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_window_boundary_is_inclusive() {
+        // 正好落在窗口边界上的消息仍然接收，避免「刚好 120 秒」被误杀。
+        let chat = ChatState::new(1);
+        let now = unix_now();
+        let on_edge = RawChat {
+            ts: (now - STALE_GRACE_SECS) as u64,
+            ..raw("边界", 2, None, true)
+        };
+        chat.ingest(vec![on_edge]).await;
+        assert_eq!(chat.messages_since(0, 10).await.0.len(), 1);
     }
 
     #[tokio::test]

@@ -26,6 +26,20 @@ pub const CONTROL_PIPE_NAME: &str = "MiliastraWonderlandChatBridgeCtl";
 /// DLL → 宿主的 debug 数据管道（单向、无 ACK）。
 pub const DEBUG_PIPE_NAME: &str = "MiliastraWonderlandChatBridgeDebug";
 
+/// 默认抓包目录：程序同目录下的 capture。
+///
+/// 有显式目录就别用这个；这里是「切到 ALL 但没指定目录」时的落点，
+/// 目的是让抓包变成纯运行时操作 —— 不用为了带目录而重启。
+pub fn default_capture_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("capture")))
+        .unwrap_or_else(|| PathBuf::from("capture"))
+}
+
+/// 默认抓包上限（总字节）。超过后只停止抓包，不影响聊天与转发。
+pub const DEFAULT_CAPTURE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 /// raw 落盘队列长度（包数）。满了只丢抓包，不阻塞 debug 读线程。
 const CAPTURE_QUEUE: usize = 4096;
 /// index.csv 每多少条 flush 一次。
@@ -86,7 +100,10 @@ pub struct PacketControl {
     stats: Mutex<BTreeMap<u16, CmdStat>>,
     packets: AtomicU64,
     bytes: AtomicU64,
-    capture: Option<CaptureSink>,
+    /// 运行期可开关：切 ALL 或调 /debug/capture 时在这里装拆。
+    capture: Mutex<Option<CaptureSink>>,
+    /// 切到 ALL 时是否自动开抓包。默认开；--no-auto-capture 或测试里关掉。
+    auto_capture: AtomicBool,
 }
 
 impl PacketControl {
@@ -105,7 +122,8 @@ impl PacketControl {
             stats: Mutex::new(BTreeMap::new()),
             packets: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
-            capture,
+            capture: Mutex::new(capture),
+            auto_capture: AtomicBool::new(true),
         })
     }
 
@@ -156,6 +174,73 @@ impl PacketControl {
         tracing::info!("DLL 控制管道已连接，当前模式 {}", mode.as_str());
     }
 
+    /// 当前是否在抓包。
+    pub fn capture_active(&self) -> bool {
+        lock(&self.capture).is_some()
+    }
+
+    /// 运行期开启抓包。dir 为 None 时落到 default_capture_dir()。
+    ///
+    /// 好处是不用为了带 --capture-dir 重启进程：切到 ALL 就自动抓，
+    /// 也可以在这里改目录重新开始。
+    pub fn start_capture(&self, dir: Option<PathBuf>, max_bytes: u64) -> Result<PathBuf, String> {
+        let max_bytes = if max_bytes == 0 {
+            DEFAULT_CAPTURE_MAX_BYTES
+        } else {
+            max_bytes
+        };
+        let dir = dir.unwrap_or_else(default_capture_dir);
+        let mut guard = lock(&self.capture);
+        if guard.is_some() {
+            return Err("抓包已在进行中，先停再改".to_owned());
+        }
+        match CaptureSink::start(CaptureConfig {
+            dir: dir.clone(),
+            max_bytes,
+        }) {
+            Ok(sink) => {
+                *guard = Some(sink);
+                Ok(dir)
+            }
+            Err(error) => Err(format!("{error:#}")),
+        }
+    }
+
+    /// 停止抓包并等待落盘线程退出。返回之前是否在抓。
+    pub fn stop_capture(&self) -> bool {
+        let mut guard = lock(&self.capture);
+        guard.take().is_some()
+    }
+
+    /// 切到 ALL 时确保抓包已开（用默认目录）。已开则不动。
+    /// 控制「切到 ALL 时是否自动开抓包」。
+    pub fn set_auto_capture(&self, enabled: bool) {
+        self.auto_capture.store(enabled, Ordering::Relaxed);
+    }
+
+    /// 切到 ALL 时由 HTTP 层调用：没在抓就按默认目录开一个。
+    ///
+    /// 放在 HTTP 层而不是 set_mode 里，是为了让 PacketControl 在单测里保持
+    /// 无副作用（否则一测切模式就会在临时目录里建 capture）。
+    pub fn ensure_capture_for_all(&self) -> Option<PathBuf> {
+        if !self.auto_capture.load(Ordering::Relaxed) {
+            return None;
+        }
+        if lock(&self.capture).is_some() {
+            return None;
+        }
+        match self.start_capture(None, DEFAULT_CAPTURE_MAX_BYTES) {
+            Ok(dir) => {
+                tracing::info!("已自动开启 raw 抓包：{}", dir.display());
+                Some(dir)
+            }
+            Err(error) => {
+                tracing::warn!("自动开启 raw 抓包失败（只影响抓包）：{error}");
+                None
+            }
+        }
+    }
+
     pub fn detach_control(&self) {
         *lock(&self.control) = None;
         self.control_connected.store(false, Ordering::Relaxed);
@@ -174,7 +259,7 @@ impl PacketControl {
             entry.count += 1;
             entry.bytes += payload.len() as u64;
         }
-        if let Some(capture) = &self.capture {
+        if let Some(capture) = lock(&self.capture).as_ref() {
             capture.submit(cmd, payload);
         }
     }
@@ -201,7 +286,7 @@ impl PacketControl {
                 "bytes": self.bytes.load(Ordering::Relaxed),
                 "cmds": cmds,
             },
-            "capture": self.capture.as_ref().map(CaptureSink::snapshot_json),
+            "capture": lock(&self.capture).as_ref().map(CaptureSink::snapshot_json),
         })
     }
 }

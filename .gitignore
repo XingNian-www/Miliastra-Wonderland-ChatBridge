@@ -13,3 +13,6 @@
 # 文档只提交接口规格，其余（对接指引、实现约束）留在本地。
 docs/*
 !docs/API.md
+
+# 游戏版本配置要随仓库发布，给 *.json 开个例外。
+!config/game-config.json

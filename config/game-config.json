@@ -1,0 +1,56 @@
+{
+  "schema": "miliastra-chatbridge-game-config/v1",
+  "updatedAt": "2026-11-04T04:30:00Z",
+  "envelope": [
+    24007,
+    486
+  ],
+  "versions": [
+    {
+      "gameVersion": "7.2.0",
+      "exeCrc32": "8cb60f3d",
+      "rva": {
+        "updateNormalProp": "0x12178db0",
+        "newString": "0x00000000",
+        "findGameObject": "0x00000000",
+        "eventSystemUpdate": "0x00000000",
+        "simulatePointerClick": "0x00000000",
+        "toInt32": "0x19b541a0",
+        "tcpStatePtr": "0x0586d7e0",
+        "sharedInfoPtr": "0x0586d7e8",
+        "decompress": "0x06f0f970"
+      }
+    }
+  ],
+  "layouts": [
+    {
+      "id": "7.2",
+      "events": 12,
+      "innerType": 2,
+      "payload": 14,
+      "bodyHall": 5,
+      "bodyPrivate": 4,
+      "ts": 2,
+      "fromUid": 1,
+      "toUid": 6,
+      "text": 630,
+      "hallCtx": 4,
+      "hallType": 1,
+      "hallId": 2,
+      "populationHall": 5,
+      "recordList": 10,
+      "recordUid": 1,
+      "recordName": 2,
+      "recordRemark": 17,
+      "innerHallChat": 29636,
+      "innerPrivateChat": 28274,
+      "innerPrivateHistory": 25574,
+      "innerHallPopulation": 7470,
+      "innerHallMembers": 29039,
+      "memberList": 13,
+      "memberUid": 9,
+      "memberName": 3,
+      "innerFriendList": 29281
+    }
+  ]
+}

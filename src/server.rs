@@ -80,6 +80,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/debug/packets",
             get(debug_packets_get).post(debug_packets_set),
         )
+        // 抓包开关：运行期开/关与换目录，不用为 --capture-dir 重启进程。
+        .route(
+            "/debug/capture",
+            get(debug_capture_get).post(debug_capture_set),
+        )
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
@@ -391,6 +396,17 @@ struct PacketModeBody {
     mode: String,
 }
 
+/// /debug/capture 的 POST 体。enabled=false 表示停止；dir/maxMib 只在启动时用。
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugCaptureBody {
+    enabled: bool,
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    max_mib: Option<u64>,
+}
+
 /// 切换调试包模式。
 ///
 /// 响应里的 applied 表示是否真的写到了 DLL 控制管道：DLL 未连接或
@@ -429,13 +445,79 @@ async fn debug_packets_set(
             false
         }
     };
+    // 切到 ALL 就顺手把抓包打开：省掉「为了抓包重启一次」这个步骤。
+    let capture_dir = if mode == PacketMode::All {
+        state.packets.ensure_capture_for_all()
+    } else {
+        None
+    };
     Json(json!({
         "ok": true,
         "mode": mode.as_str(),
         "applied": applied,
         "dllControl": state.packets.control_connected(),
+        "captureDir": capture_dir.map(|dir| dir.display().to_string()),
+        "captureActive": state.packets.capture_active(),
     }))
     .into_response()
+}
+
+async fn debug_capture_get(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "active": state.packets.capture_active(),
+        "defaultDir": crate::packet_control::default_capture_dir().display().to_string(),
+        "capture": state.packets.snapshot_json()["capture"].clone(),
+    }))
+    .into_response()
+}
+
+async fn debug_capture_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<DebugCaptureBody>, JsonRejection>,
+) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(err) => {
+            return ApiError(StatusCode::BAD_REQUEST, "bad_request", err.body_text())
+                .into_response();
+        }
+    };
+    let packets = Arc::clone(&state.packets);
+    let dir = body.dir.map(std::path::PathBuf::from);
+    let max_bytes = body.max_mib.unwrap_or(0).saturating_mul(1024 * 1024);
+    let result = tokio::task::spawn_blocking(move || {
+        if body.enabled {
+            packets
+                .start_capture(dir, max_bytes)
+                .map(|path| json!({ "active": true, "dir": path.display().to_string() }))
+        } else {
+            Ok(json!({ "active": false, "stopped": packets.stop_capture() }))
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Json(json!({ "ok": true, "capture": value })).into_response(),
+        Ok(Err(message)) => {
+            ApiError(StatusCode::BAD_REQUEST, "bad_request", message).into_response()
+        }
+        Err(error) => {
+            tracing::warn!("切换抓包任务失败：{error}");
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                error.to_string(),
+            )
+            .into_response()
+        }
+    }
 }
 
 async fn handle_socket<S, E>(mut socket: S, state: Arc<AppState>)
@@ -814,6 +896,100 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// 构造任意路径的 JSON 请求（/debug/capture 用）。
+    fn json_request(
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+        token: Option<&str>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("x-miliastra-token", token);
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        builder
+            .body(match body {
+                Some(body) => axum::body::Body::from(body.to_string()),
+                None => axum::body::Body::empty(),
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn debug_capture_requires_token() {
+        let state = app_state(true);
+        let app = router(state);
+        for method in ["GET", "POST"] {
+            let body = (method == "POST").then_some(r#"{"enabled":true}"#);
+            let response = app
+                .clone()
+                .oneshot(json_request(method, "/debug/capture", body, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn debug_capture_starts_and_stops_without_restart() {
+        // 这条用例守护的核心诉求：抓包必须能在运行期打开，不用为了带目录重启进程。
+        let state = app_state(true);
+        state.packets.set_auto_capture(false);
+        let app = router(state.clone());
+        let dir = std::env::temp_dir().join("mwc-capture-api-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let body = format!(
+            r#"{{"enabled":true,"dir":{},"maxMib":1}}"#,
+            serde_json::to_string(&dir.display().to_string()).expect("路径转字符串")
+        );
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/debug/capture",
+                Some(&body),
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["capture"]["active"], true);
+        assert!(dir.exists(), "抓包目录应被创建");
+
+        // GET 反映正在抓包。
+        let response = app
+            .clone()
+            .oneshot(json_request("GET", "/debug/capture", None, Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["active"], true);
+
+        // 停止后线程退出、目录仍在但不再写。
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/debug/capture",
+                Some(r#"{"enabled":false}"#),
+                Some("secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["capture"]["stopped"], true);
+        let response = app
+            .oneshot(json_request("GET", "/debug/capture", None, Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(json_body(response).await["active"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn debug_packets_require_token() {
         for method in ["GET", "POST"] {
@@ -842,6 +1018,8 @@ mod tests {
     #[tokio::test]
     async fn debug_packets_post_switches_mode_and_reports_applied() {
         let state = app_state(true);
+        // 测试里别真的往磁盘写抓包。
+        state.packets.set_auto_capture(false);
         let app = router(state.clone());
         // 同路由注册 POST，不能被全局 method_not_allowed 兜底抢成 405。
         let response = app
@@ -855,10 +1033,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let value = json_body(response).await;
-        assert_eq!(
-            value,
-            json!({ "ok": true, "mode": "all", "applied": false, "dllControl": false })
-        );
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["mode"], "all");
+        assert_eq!(value["applied"], false);
+        assert_eq!(value["dllControl"], false);
+        // 自动抓包被关掉时不建目录、不报错。
+        assert_eq!(value["captureActive"], false);
+        assert!(value["captureDir"].is_null());
         // DLL 未连接时只在宿主侧记录模式：GET 立即反映 all，且不报错。
         let response = app
             .clone()
@@ -952,11 +1133,18 @@ mod tests {
     }
 
     fn private_message() -> crate::extract::RawChat {
+        private_message_text("hello")
+    }
+
+    /// 内容不同的私聊消息。压广播队列的用例要靠文本区分，
+    /// 否则会被 state 的重放去重（同一 发送者+时间戳+文本）当成重复丢掉。
+    fn private_message_text(text: &str) -> crate::extract::RawChat {
         crate::extract::RawChat {
-            ts: 1,
+            // 必须是「现在」，否则会被历史重放过滤掉（见 state::STALE_GRACE_SECS）。
+            ts: crate::state::now_unix_secs(),
             from_uid: 1,
             to_uid: Some(999),
-            text: "hello".into(),
+            text: text.into(),
             hall_id: None,
             hall_type: None,
             is_private: true,
@@ -1062,10 +1250,11 @@ mod tests {
         output.recv().await.unwrap();
         state
             .chat
-            .ingest(vec![
-                private_message();
-                crate::state::BROADCAST_CAPACITY * 2
-            ])
+            .ingest(
+                (0..crate::state::BROADCAST_CAPACITY * 2)
+                    .map(|index| private_message_text(&format!("m{index}")))
+                    .collect::<Vec<_>>(),
+            )
             .await;
         release.send(()).unwrap();
         let Message::Close(Some(frame)) = output.recv().await.unwrap() else {

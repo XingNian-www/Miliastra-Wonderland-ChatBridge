@@ -106,14 +106,131 @@ internal static unsafe class Application {
     private static int _forwardingDisabled;
     private static long _invalidPacketLengthCount;
     private static long _forwardErrorLogCount;
+    private static long _hookEnteredCount;
+    private static long _badMagicCount;
+    private static long _tryGetDataFailCount;
+    private static long _acceptedCount;
+    /// <summary>探针：各候选地址被调用次数（诊断 7.2 地址用）。</summary>
+    private static readonly long[] _probeHits = new long[8];
+    /// <summary>因 cmdId 未订阅而被丢弃的包数。</summary>
+    private static long _filteredCount;
+    /// <summary>最近一个未订阅的 cmdId（诊断用）。</summary>
+    private static int _lastFilteredCmd;
+    /// <summary>订阅列表快照（诊断用，最多 8 项）。</summary>
+    private static readonly uint[] _requiredSample = new uint[8];
+    /// <summary>第一个包的 val+0..+0x28 原始字节（诊断用，5 个 u64）。</summary>
+    private static readonly ulong[] _probeLen = new ulong[5];
+    private static int _probeLenDone;
+
+    /// <summary>前 6 个不同包的原始头部（每包 8 字节，诊断用）。</summary>
+    private static readonly ulong[] _rawHeader = new ulong[6];
+    private static int _rawCount;
+    private static uint _lastRawCmd;
+
+    /// <summary>最近见到的 cmdId（环形，诊断用）。</summary>
+    private static readonly uint[] _cmdSeen = new uint[8];
+    private static int _cmdSeenIdx;
+    private static long _cmdSeenTotal;
     // Must match the host pipe protocol MAX_PAYLOAD (1 MiB).
     internal const uint MaxPacketDataLength = 1024 * 1024;
+
+    /// <summary>钩子被调用且 startIndex==6 的次数（= 真正进入网络包路径）。</summary>
+    internal static long HookEnteredCount => Interlocked.Read(ref _hookEnteredCount);
+
+    /// <summary>包起始魔数不是 0x6745 的次数（7.2 若改了包格式，这个会飙升）。</summary>
+    internal static long BadMagicCount => Interlocked.Read(ref _badMagicCount);
+
+    /// <summary>通过魔数校验但 TryGetData 返回 false 的次数（多为解压失败）。</summary>
+    internal static long TryGetDataFailCount => Interlocked.Read(ref _tryGetDataFailCount);
+
+    /// <summary>成功提取出包体并转发的次数。</summary>
+    internal static long AcceptedCount => Interlocked.Read(ref _acceptedCount);
+
+    /// <summary>当前 RequiredPackets 数量。直接读集合，供 1 Hz 心跳采样。</summary>
+    internal static long RequiredCount {
+        get {
+            lock (RequiredPackets) {
+                return RequiredPackets.Count;
+            }
+        }
+    }
+
+    /// <summary>因未订阅被过滤的包数。</summary>
+    internal static long FilteredCount => Interlocked.Read(ref _filteredCount);
+
+    /// <summary>最近被过滤的 cmdId。</summary>
+    internal static long LastFilteredCmd => Volatile.Read(ref _lastFilteredCmd);
+
+    /// <summary>订阅列表第 i 项（诊断用）。</summary>
+    internal static long RequiredSample(int i) => Volatile.Read(ref _requiredSample[i]);
+
+    /// <summary>最近见到的 cmdId 第 i 项（环形缓冲）。</summary>
+    internal static long CmdSeen(int i) => Volatile.Read(ref _cmdSeen[i]);
+
+    /// <summary>已见到的包总数。</summary>
+    internal static long CmdSeenTotal => Interlocked.Read(ref _cmdSeenTotal);
+
+    /// <summary>第 i 个不同包的原始 8 字节头。</summary>
+    internal static ulong RawHeader(int i) => Volatile.Read(ref _rawHeader[i]);
+
+    /// <summary>第一个包 val+0..+0x28 的字节（每 8 字节一组）。</summary>
+    internal static ulong ProbeLen(int i) => Volatile.Read(ref _probeLen[i]);
+
+    /// <summary>记录一个见到的 cmdId。</summary>
+    private static void RecordCmd(ushort cmd) {
+        Interlocked.Increment(ref _cmdSeenTotal);
+        var idx = (int) (Interlocked.Increment(ref _cmdSeenIdx) & 7);
+        Volatile.Write(ref _cmdSeen[idx], cmd);
+    }
+
+    /// <summary>把当前订阅列表的前 8 项拍一份快照，供心跳上报。</summary>
+    internal static void SnapshotRequired() {
+        lock (RequiredPackets) {
+            var i = 0;
+            foreach (var cmd in RequiredPackets) {
+                if (i >= _requiredSample.Length) {
+                    break;
+                }
+                Volatile.Write(ref _requiredSample[i], cmd);
+                i++;
+            }
+            for (; i < _requiredSample.Length; i++) {
+                Volatile.Write(ref _requiredSample[i], 0);
+            }
+        }
+    }
+
+    /// <summary>探针计数：第 i 个候选地址被调用的次数。</summary>
+    internal static long ProbeHits(int i) => Interlocked.Read(ref _probeHits[i]);
+
+    /// <summary>探针总数（用于健康帧打包）。</summary>
+    internal static long ProbeTotal() {
+        long sum = 0;
+        for (var i = 0; i < _probeHits.Length; i++) {
+            sum += Interlocked.Read(ref _probeHits[i]);
+        }
+        return sum;
+    }
+
+    [UnmanagedCallersOnly]
+    private static int OnProbe(byte* val, int startIndex) {
+        Interlocked.Increment(ref _probeHits[0]);
+        return 0;
+    }
 
     /// <summary>
     /// 因 native 长度字段不可信而丢弃的包数（观测用）。见 <see cref="OnToInt32"/>：
     /// 这类包绝不做无边界指针运算（越界读的 AccessViolation 无法被托管 catch 捕获）。
     /// </summary>
     internal static long InvalidPacketLengthCount => Interlocked.Read(ref _invalidPacketLengthCount);
+
+    /// <summary>
+    /// 转发过程中的托管异常次数（IO/解压/格式）。
+    ///
+    /// 与 <see cref="InvalidPacketLengthCount"/> 一起通过健康心跳上报，用来区分
+    /// 「钩子根本没被调用」和「包进了钩子但被 TryGetData 丢弃」——后者非 0。
+    /// </summary>
+    internal static long ForwardErrorCount => Interlocked.Read(ref _forwardErrorLogCount);
 
     /// <summary>宿主是否订阅了这个 cmd。保持与原有实现相同的锁语义。</summary>
     internal static bool IsRequired(ushort cmdId) {
@@ -138,6 +255,11 @@ internal static unsafe class Application {
             return ret;
         }
         void* unzipBuf = null;
+        if (Interlocked.Exchange(ref _probeLenDone, 1) == 0) {
+            for (var i = 0; i < _probeLen.Length; i++) {
+                Volatile.Write(ref _probeLen[i], *(ulong*) (val + i * 8));
+            }
+        }
         try {
             // IL2CPP byte[] 的 native 长度紧挨在数据之前（偏移 0x18）。
             // 这个布局是推断值；长度不可信时**直接丢弃该包**：绝不退化成"无边界检查"，
@@ -152,18 +274,31 @@ internal static unsafe class Application {
                 }
                 return ret;
             }
+            Interlocked.Increment(ref _hookEnteredCount);
             val += 0x20;
             if (*(ushort*) val != 0x6745) {
+                Interlocked.Increment(ref _badMagicCount);
                 return ret;
             }
             var cmdId = BinaryPrimitives.ReverseEndianness(*(ushort*) (val + 2));
+            RecordCmd(cmdId);
+            if (cmdId != _lastRawCmd) {
+                Volatile.Write(ref _lastRawCmd, cmdId);
+                var slot = Interlocked.Increment(ref _rawCount) - 1;
+                if (slot >= 0 && slot < _rawHeader.Length) {
+                    Volatile.Write(ref _rawHeader[slot], *(ulong*) val);
+                }
+            }
             // RequiredPackets 查询保持原锁；AllPackets 是 volatile 读，放锁外避免每条包争锁。
             var required = IsRequired(cmdId);
             var allPackets = ModeControl.AllPackets;
             if (!required && !allPackets) {
+                Interlocked.Increment(ref _filteredCount);
+                Volatile.Write(ref _lastFilteredCmd, cmdId);
                 return ret;
             }
             if (TryGetData(val, (int) packetLength, out var data, out unzipBuf)) {
+                Interlocked.Increment(ref _acceptedCount);
                 // 只复制并入队，立即返回：这一步绝不能碰管道。
                 if (required) {
                     // 容量检查、满队列 Dropped 计数与载荷拷贝都在 Enqueue 内部；
@@ -177,6 +312,8 @@ internal static unsafe class Application {
                     // TryGetData 已按 MaxPacketDataLength(1 MiB) 过滤，debug 包与聊天包同一上限。
                     DebugOutbox.Enqueue(cmdId, data);
                 }
+            } else {
+                Interlocked.Increment(ref _tryGetDataFailCount);
             }
         } catch (Exception ex) when (
             // InvalidDataException 与 IOException 是兄弟（都继承 SystemException），

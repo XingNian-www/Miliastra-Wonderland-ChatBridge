@@ -113,6 +113,34 @@ pub struct Snapshot {
     /// 按 seq 缺口推算的累计丢帧数（wrapping 语义）。
     pub lost_frames: u64,
     pub parse_errors: u64,
+    /// DLL 因 packetLength 异常丢弃的包数（协议 v2 诊断字段）。
+    pub invalid_length: u64,
+    /// DLL 转发过程中的异常次数（协议 v2 诊断字段）。
+    pub forward_errors: u64,
+    /// 钩子进入网络包路径的次数（协议 v3）。
+    pub hook_entered: u64,
+    /// 包起始魔数不匹配次数（协议 v3）。
+    pub bad_magic: u64,
+    /// 魔数通过但 TryGetData 失败次数（协议 v3）。
+    pub try_get_data_fail: u64,
+    /// 成功提取并转发的包数（协议 v3）。
+    pub accepted: u64,
+    /// 当前订阅的 cmdId 数量（协议 v4）。
+    pub required_count: u64,
+    /// 因 cmdId 未订阅被过滤的包数（协议 v4）。
+    pub filtered: u64,
+    /// 最近被过滤的 cmdId（协议 v4）。
+    pub last_filtered_cmd: u64,
+    /// 订阅列表前 8 项（协议 v5）。
+    pub required_sample: [u64; 8],
+    /// 最近见到的 cmdId（协议 v6）。
+    pub cmd_seen: [u64; 8],
+    /// 已见到的包总数（协议 v6）。
+    pub cmd_seen_total: u64,
+    /// 不同包的原始 8 字节头（协议 v7）。
+    pub raw_header: [u64; 6],
+    /// 第一个包的 40 字节探针（协议 v8）。
+    pub probe_len: [u64; 5],
 }
 
 impl Snapshot {
@@ -131,6 +159,20 @@ impl Snapshot {
             "seq": self.seq,
             "lostFrames": self.lost_frames,
             "parseErrors": self.parse_errors,
+            "invalidLength": self.invalid_length,
+            "forwardErrors": self.forward_errors,
+            "hookEntered": self.hook_entered,
+            "badMagic": self.bad_magic,
+            "tryGetDataFail": self.try_get_data_fail,
+            "accepted": self.accepted,
+            "requiredCount": self.required_count,
+            "filtered": self.filtered,
+            "lastFilteredCmd": self.last_filtered_cmd,
+            "requiredSample": self.required_sample,
+            "cmdSeen": self.cmd_seen,
+            "cmdSeenTotal": self.cmd_seen_total,
+            "rawHeader": self.raw_header,
+            "probeLen": self.probe_len,
         })
     }
 }
@@ -286,6 +328,20 @@ impl HealthState {
                 seq: 0,
                 lost_frames,
                 parse_errors,
+                invalid_length: 0,
+                forward_errors: 0,
+                hook_entered: 0,
+                bad_magic: 0,
+                try_get_data_fail: 0,
+                accepted: 0,
+                required_count: 0,
+                filtered: 0,
+                last_filtered_cmd: 0,
+                required_sample: [0; 8],
+                cmd_seen: [0; 8],
+                cmd_seen_total: 0,
+                raw_header: [0; 6],
+                probe_len: [0; 5],
             };
         };
         let age = now.saturating_duration_since(last);
@@ -315,6 +371,20 @@ impl HealthState {
             seq: frame.seq,
             lost_frames,
             parse_errors,
+            invalid_length: frame.invalid_length,
+            forward_errors: frame.forward_errors,
+            hook_entered: frame.hook_entered,
+            bad_magic: frame.bad_magic,
+            try_get_data_fail: frame.try_get_data_fail,
+            accepted: frame.accepted,
+            required_count: frame.required_count,
+            filtered: frame.filtered,
+            last_filtered_cmd: frame.last_filtered_cmd,
+            required_sample: frame.required_sample,
+            cmd_seen: frame.cmd_seen,
+            cmd_seen_total: frame.cmd_seen_total,
+            raw_header: frame.raw_header,
+            probe_len: frame.probe_len,
         }
     }
 

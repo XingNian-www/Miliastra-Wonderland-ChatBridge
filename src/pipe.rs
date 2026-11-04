@@ -73,12 +73,17 @@ pub fn parse(kind: u8, body: &[u8]) -> Result<Option<(Frame, usize)>> {
 
 /// 对一帧的应答字节。
 pub fn reply(frame: &Frame, rva: &crate::metadata::MethodRva) -> Vec<u8> {
+    reply_with_cmds(frame, rva, &[])
+}
+
+/// 带订阅表覆盖的握手回执。cmds 为空时回落到编译期默认。
+pub fn reply_with_cmds(frame: &Frame, rva: &crate::metadata::MethodRva, cmds: &[u16]) -> Vec<u8> {
     match frame {
         Frame::LoadTasks => {
             // 订阅信封 2246 与独立私聊 486，两者都可能承载聊天。
             let mut out = Vec::new();
-            for cmd in crate::extract::WANTED_CMDS {
-                out.extend(u32::from(*cmd).to_le_bytes());
+            for cmd in crate::extract::wanted_cmds(cmds) {
+                out.extend(u32::from(cmd).to_le_bytes());
             }
             out.extend(u32::MAX.to_le_bytes());
             out
@@ -190,9 +195,9 @@ mod tests {
         }
         expected.extend(u32::MAX.to_le_bytes());
         assert_eq!(reply, expected);
-        // 私聊是独立 cmd 486；只订阅 2246 会收不到好友消息。
+        // 私聊是独立 cmd 486；只订阅信封会收不到好友消息。
         assert!(crate::extract::WANTED_CMDS.contains(&486));
-        assert!(crate::extract::WANTED_CMDS.contains(&2246));
+        assert!(crate::extract::WANTED_CMDS.contains(&crate::extract::CMD_ENVELOPE));
     }
 
     #[test]

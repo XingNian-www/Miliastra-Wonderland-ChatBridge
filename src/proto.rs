@@ -58,6 +58,23 @@ impl Fields {
             .collect()
     }
 
+    /// 所有出现过的字段号（按首次出现顺序去重）。诊断用：
+    /// 游戏改版后字段号会变，需要先看清真实布局再改常量。
+    pub fn field_numbers(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for (field, _) in &self.values {
+            if !out.contains(field) {
+                out.push(*field);
+            }
+        }
+        out
+    }
+
+    /// 某个字段号出现过几次。
+    pub fn count_of(&self, field: u32) -> usize {
+        self.values.iter().filter(|(f, _)| *f == field).count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }

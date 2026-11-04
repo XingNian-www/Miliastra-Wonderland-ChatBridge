@@ -32,7 +32,7 @@ internal static class HealthReporter {
     internal const ushort FrameMagic = 0x4D57;
     internal const byte FrameVersion = 1;
     internal const byte FrameKind = 0x01;
-    internal const int FrameSize = 28;
+    internal const int FrameSize = 324;
 
     internal const uint FlagChatDisabled = 1u << 0;
     internal const uint FlagReconnecting = 1u << 1;
@@ -139,9 +139,31 @@ internal static class HealthReporter {
     }
 
     /// <summary>按当前静态状态编码一帧心跳（测试可直接验证帧格式/字段）。</summary>
-    internal static byte[] EncodeFrame(uint seq) =>
-        EncodeFrameFields(seq, CurrentFlags(), unchecked((ulong) PacketOutbox.TimeoutCount),
-            unchecked((ulong) Goshujin.AbandonedIoTaskCount));
+    internal static byte[] EncodeFrame(uint seq) {
+        Application.SnapshotRequired();
+        return EncodeFrameFields(seq, CurrentFlags(), unchecked((ulong) PacketOutbox.TimeoutCount),
+            unchecked((ulong) Goshujin.AbandonedIoTaskCount),
+            unchecked((ulong) Application.InvalidPacketLengthCount),
+            unchecked((ulong) Application.ForwardErrorCount),
+            unchecked((ulong) Application.HookEnteredCount),
+            unchecked((ulong) Application.BadMagicCount),
+            unchecked((ulong) Application.TryGetDataFailCount),
+            unchecked((ulong) Application.AcceptedCount),
+            unchecked((ulong) Application.RequiredCount),
+            unchecked((ulong) Application.FilteredCount),
+            unchecked((ulong) Application.LastFilteredCmd),
+            unchecked((ulong) Application.RequiredSample(0)), unchecked((ulong) Application.RequiredSample(1)),
+            unchecked((ulong) Application.RequiredSample(2)), unchecked((ulong) Application.RequiredSample(3)),
+            unchecked((ulong) Application.RequiredSample(4)), unchecked((ulong) Application.RequiredSample(5)),
+            unchecked((ulong) Application.RequiredSample(6)), unchecked((ulong) Application.RequiredSample(7)),
+            Application.CmdSeen(0), Application.CmdSeen(1), Application.CmdSeen(2), Application.CmdSeen(3),
+            Application.CmdSeen(4), Application.CmdSeen(5), Application.CmdSeen(6), Application.CmdSeen(7),
+            Application.CmdSeenTotal,
+            Application.RawHeader(0), Application.RawHeader(1), Application.RawHeader(2),
+            Application.RawHeader(3), Application.RawHeader(4), Application.RawHeader(5),
+            Application.ProbeLen(0), Application.ProbeLen(1), Application.ProbeLen(2),
+            Application.ProbeLen(3), Application.ProbeLen(4));
+    }
 
     /// <summary>
     /// 纯函数版编码：字段全部由调用方给出，不读任何静态状态。
@@ -150,7 +172,74 @@ internal static class HealthReporter {
     /// 做逐字节比对。若只测 ParseHealthFrame（解码器），「发射端改了字节序或字段偏移」
     /// 不会被黄金向量抓到，只能靠间接的行为断言兜。
     /// </summary>
-    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount, ulong abandonedTasks) {
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount, ulong abandonedTasks) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, 0, 0);
+
+    /// <summary>带诊断计数的完整版编码（协议 v2，帧长 44 字节）。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, invalidLength, forwardErrors,
+            0, 0, 0, 0, 0, 0, 0);
+
+    /// <summary>协议 v3：额外携带转发流水线各阶段计数，用于定位「包在哪一步被丢」。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors,
+        ulong hookEntered, ulong badMagic, ulong tryGetDataFail, ulong accepted) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, invalidLength, forwardErrors,
+            hookEntered, badMagic, tryGetDataFail, accepted, 0, 0, 0);
+
+    /// <summary>协议 v4：再带上过滤阶段计数。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors,
+        ulong hookEntered, ulong badMagic, ulong tryGetDataFail, ulong accepted,
+        ulong requiredCount, ulong filtered, ulong lastFilteredCmd) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, invalidLength, forwardErrors,
+            hookEntered, badMagic, tryGetDataFail, accepted, requiredCount, filtered, lastFilteredCmd,
+            0, 0, 0, 0, 0, 0, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+
+    /// <summary>协议 v5：额外携带订阅列表前 8 项，用于确认 LoadTasks 内容。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors,
+        ulong hookEntered, ulong badMagic, ulong tryGetDataFail, ulong accepted,
+        ulong requiredCount, ulong filtered, ulong lastFilteredCmd,
+        ulong s0, ulong s1, ulong s2, ulong s3, ulong s4, ulong s5, ulong s6, ulong s7) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, invalidLength, forwardErrors,
+            hookEntered, badMagic, tryGetDataFail, accepted, requiredCount, filtered, lastFilteredCmd,
+            s0, s1, s2, s3, s4, s5, s6, s7, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    /// <summary>协议 v6：再带上观测到的 cmdId 环形缓冲。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors,
+        ulong hookEntered, ulong badMagic, ulong tryGetDataFail, ulong accepted,
+        ulong requiredCount, ulong filtered, ulong lastFilteredCmd,
+        ulong s0, ulong s1, ulong s2, ulong s3, ulong s4, ulong s5, ulong s6, ulong s7,
+        long c0, long c1, long c2, long c3, long c4, long c5, long c6, long c7, long cTotal) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, invalidLength, forwardErrors,
+            hookEntered, badMagic, tryGetDataFail, accepted, requiredCount, filtered, lastFilteredCmd,
+            s0, s1, s2, s3, s4, s5, s6, s7, c0, c1, c2, c3, c4, c5, c6, c7, cTotal, 0, 0, 0, 0, 0, 0);
+
+    /// <summary>协议 v7：带上不同包的原始 8 字节头。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors,
+        ulong hookEntered, ulong badMagic, ulong tryGetDataFail, ulong accepted,
+        ulong requiredCount, ulong filtered, ulong lastFilteredCmd,
+        ulong s0, ulong s1, ulong s2, ulong s3, ulong s4, ulong s5, ulong s6, ulong s7,
+        long c0, long c1, long c2, long c3, long c4, long c5, long c6, long c7, long cTotal,
+        ulong r0, ulong r1, ulong r2, ulong r3, ulong r4, ulong r5) =>
+        EncodeFrameFields(seq, flags, timeoutCount, abandonedTasks, invalidLength, forwardErrors,
+            hookEntered, badMagic, tryGetDataFail, accepted, requiredCount, filtered, lastFilteredCmd,
+            s0, s1, s2, s3, s4, s5, s6, s7, c0, c1, c2, c3, c4, c5, c6, c7, cTotal,
+            r0, r1, r2, r3, r4, r5, 0, 0, 0, 0, 0);
+
+    /// <summary>协议 v8：带上第一个包的完整 40 字节，判断 val 语义。</summary>
+    internal static byte[] EncodeFrameFields(uint seq, uint flags, ulong timeoutCount,
+        ulong abandonedTasks, ulong invalidLength, ulong forwardErrors,
+        ulong hookEntered, ulong badMagic, ulong tryGetDataFail, ulong accepted,
+        ulong requiredCount, ulong filtered, ulong lastFilteredCmd,
+        ulong s0, ulong s1, ulong s2, ulong s3, ulong s4, ulong s5, ulong s6, ulong s7,
+        long c0, long c1, long c2, long c3, long c4, long c5, long c6, long c7, long cTotal,
+        ulong r0, ulong r1, ulong r2, ulong r3, ulong r4, ulong r5,
+        ulong p0, ulong p1, ulong p2, ulong p3, ulong p4) {
         var frame = new byte[FrameSize];
         BinaryPrimitives.WriteUInt16LittleEndian(frame.AsSpan(0), FrameMagic);
         frame[2] = FrameVersion;
@@ -159,6 +248,32 @@ internal static class HealthReporter {
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(8), flags);
         BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(12), timeoutCount);
         BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(20), abandonedTasks);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(28), invalidLength);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(36), forwardErrors);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(44), hookEntered);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(52), badMagic);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(60), tryGetDataFail);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(68), accepted);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(76), requiredCount);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(84), filtered);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(92), lastFilteredCmd);
+        var samples = new[] { s0, s1, s2, s3, s4, s5, s6, s7 };
+        for (var i = 0; i < samples.Length; i++) {
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(100 + i * 8), samples[i]);
+        }
+        var seen = new[] { c0, c1, c2, c3, c4, c5, c6, c7 };
+        for (var i = 0; i < seen.Length; i++) {
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(164 + i * 8), unchecked((ulong) seen[i]));
+        }
+        BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(228), unchecked((ulong) cTotal));
+        var raw = new[] { r0, r1, r2, r3, r4, r5 };
+        for (var i = 0; i < raw.Length; i++) {
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(236 + i * 8), raw[i]);
+        }
+        var probe = new[] { p0, p1, p2, p3, p4 };
+        for (var i = 0; i < probe.Length; i++) {
+            BinaryPrimitives.WriteUInt64LittleEndian(frame.AsSpan(284 + i * 8), probe[i]);
+        }
         return frame;
     }
 

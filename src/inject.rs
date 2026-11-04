@@ -71,6 +71,7 @@ pub async fn run(
     game_path: Option<std::path::PathBuf>,
     reattach_window: Duration,
     cancelled: Arc<AtomicBool>,
+    wanted_cmds: Vec<u16>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let result = supervise(
@@ -85,6 +86,7 @@ pub async fn run(
             game_path.as_deref(),
             reattach_window,
             &cancelled,
+            &wanted_cmds,
         );
         connected.store(false, Ordering::Relaxed);
         crate::diag::dll_connected(false);
@@ -145,6 +147,7 @@ fn supervise(
     game_path: Option<&std::path::Path>,
     reattach_window: Duration,
     cancelled: &AtomicBool,
+    wanted_cmds: &[u16],
 ) -> Result<()> {
     check_cancelled(cancelled)?;
     if !auto_launch {
@@ -215,7 +218,7 @@ fn supervise(
         crate::diag::dll_connected(true);
         session.mark_attached();
         tracing::info!("DLL 已连接，开始收包");
-        let end = serve_connected(&peer, &mut stream, &rva, chat, cancelled)?;
+        let end = serve_connected(&peer, &mut stream, &rva, chat, cancelled, wanted_cmds)?;
 
         // 会话结束：先撤销 attached，再关闭全部管道实例。必须关闭旧实例，
         // 否则同名管道仍被占用，下一次 CreateNamedPipeW(FIRST_PIPE_INSTANCE) 失败。
@@ -346,6 +349,7 @@ fn serve_connected(
     rva: &crate::metadata::MethodRva,
     chat: &ChatState,
     cancelled: &AtomicBool,
+    wanted_cmds: &[u16],
 ) -> Result<SessionEnd> {
     use std::io::{Read, Write};
 
@@ -415,7 +419,7 @@ fn serve_connected(
             frames_seen += 1;
             // 包帧的 ACK 只表示「保持订阅」，与解析结果无关：先回执让 DLL
             // 立刻写下一包，把 dispatch 的耗时移出往返路径。
-            let reply = crate::pipe::reply(&frame, rva);
+            let reply = crate::pipe::reply_with_cmds(&frame, rva, wanted_cmds);
             let is_packet = matches!(&frame, crate::pipe::Frame::Packet { .. });
             if is_packet && !reply.is_empty() {
                 let ack_started = Instant::now();
@@ -467,69 +471,6 @@ fn serve_connected(
             }
         }
     }
-}
-
-fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
-    // 独立 486 只承载私聊；信封 2246 才有多路复用内容。
-    // 好友列表（含备注）也在 2246 信封内部（内层 #13=4410），跟着信封一起解析。
-    let (halls, names, population, chats, profiles) = if cmd == extract::CMD_PRIVATE_DIRECT {
-        (
-            None,
-            Vec::new(),
-            None,
-            extract::extract_direct_private(payload),
-            Vec::new(),
-        )
-    } else {
-        (
-            extract::extract_hall_context(payload),
-            extract::extract_names(payload),
-            extract::extract_population_hall(payload),
-            extract::extract_chats(payload),
-            extract::extract_friend_profiles(payload),
-        )
-    };
-    tracing::debug!(
-        "2246 解析: hall={:?} names={} pop={:?} chats={} profiles={}",
-        halls,
-        names.len(),
-        population,
-        chats.len(),
-        profiles.len()
-    );
-    if halls.is_none()
-        && names.is_empty()
-        && population.is_none()
-        && chats.is_empty()
-        && profiles.is_empty()
-    {
-        return;
-    }
-    // 阻塞线程里没有 tokio 上下文，用 Handle::block_on 进入运行时。
-    let handle = tokio::runtime::Handle::current();
-    handle.block_on(async {
-        if !names.is_empty() {
-            chat.record_names(names).await;
-        }
-        if !profiles.is_empty() {
-            // 进游戏全量一次、之后懒加载增量；只在全量那次打 info，避免刷日志。
-            let remarked = profiles.iter().filter(|p| p.remark.is_some()).count();
-            let total = profiles.len();
-            let baseline = chat.record_friend_profiles(profiles).await;
-            if baseline {
-                tracing::info!(
-                    "好友列表（全量基线）: {total} 条记录，其中 {remarked} 条带备注，累计备注 {} 条",
-                    chat.remark_count().await
-                );
-            } else {
-                tracing::debug!("好友列表（增量）: {total} 条记录，其中 {remarked} 条带备注");
-            }
-        }
-        if let Some(hall_id) = population {
-            chat.note_population_hall(hall_id).await;
-        }
-        chat.ingest(chats).await;
-    });
 }
 
 struct PipeHandle(windows_sys::Win32::Foundation::HANDLE);
@@ -2046,6 +1987,69 @@ fn find_remote_module(pid: u32, dll: &std::path::Path) -> Result<*mut std::ffi::
     anyhow::bail!("目标进程里找不到模块: {}", dll.display())
 }
 
+fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
+    // 独立 486 只承载私聊；信封 2246 才有多路复用内容。
+    // 好友列表（含备注）也在 2246 信封内部（内层 #13=4410），跟着信封一起解析。
+    let (halls, names, population, chats, profiles) = if cmd == extract::CMD_PRIVATE_DIRECT {
+        (
+            None,
+            Vec::new(),
+            None,
+            extract::extract_direct_private(payload),
+            Vec::new(),
+        )
+    } else {
+        (
+            extract::extract_hall_context(payload),
+            extract::extract_names(payload),
+            extract::extract_population_hall(payload),
+            extract::extract_chats(payload),
+            extract::extract_friend_profiles(payload),
+        )
+    };
+    tracing::debug!(
+        "2246 解析: hall={:?} names={} pop={:?} chats={} profiles={}",
+        halls,
+        names.len(),
+        population,
+        chats.len(),
+        profiles.len()
+    );
+    if halls.is_none()
+        && names.is_empty()
+        && population.is_none()
+        && chats.is_empty()
+        && profiles.is_empty()
+    {
+        return;
+    }
+    // 阻塞线程里没有 tokio 上下文，用 Handle::block_on 进入运行时。
+    let handle = tokio::runtime::Handle::current();
+    handle.block_on(async {
+        if !names.is_empty() {
+            chat.record_names(names).await;
+        }
+        if !profiles.is_empty() {
+            // 进游戏全量一次、之后懒加载增量；只在全量那次打 info，避免刷日志。
+            let remarked = profiles.iter().filter(|p| p.remark.is_some()).count();
+            let total = profiles.len();
+            let baseline = chat.record_friend_profiles(profiles).await;
+            if baseline {
+                tracing::info!(
+                    "好友列表（全量基线）: {total} 条记录，其中 {remarked} 条带备注，累计备注 {} 条",
+                    chat.remark_count().await
+                );
+            } else {
+                tracing::debug!("好友列表（增量）: {total} 条记录，其中 {remarked} 条带备注");
+            }
+        }
+        if let Some(hall_id) = population {
+            chat.note_population_hall(hall_id).await;
+        }
+        chat.ingest(chats).await;
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2184,7 +2188,7 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let chat = ChatState::new(999);
         let rva = sample_rva();
-        match serve_connected(&proc, &mut stream, &rva, &chat, &cancelled) {
+        match serve_connected(&proc, &mut stream, &rva, &chat, &cancelled, &[]) {
             Ok(SessionEnd::PeerClosed(reason)) => {
                 assert!(reason.contains("ACK"), "原因应说明 ACK 写失败: {reason}");
             }
@@ -2215,7 +2219,7 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let chat = ChatState::new(999);
         let rva = sample_rva();
-        match serve_connected(&proc, &mut stream, &rva, &chat, &cancelled) {
+        match serve_connected(&proc, &mut stream, &rva, &chat, &cancelled, &[]) {
             Ok(SessionEnd::PeerClosed(reason)) => {
                 assert!(reason.contains("握手"), "原因应说明握手写失败: {reason}");
             }

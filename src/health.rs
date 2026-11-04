@@ -76,7 +76,7 @@ pub const VERSION: u8 = 1;
 pub const KIND: u8 = 0x01;
 
 /// 固定帧长度（字节）。
-pub const FRAME_SIZE: usize = 28;
+pub const FRAME_SIZE: usize = 324;
 
 /// flags bit0：聊天发送队列（PacketOutbox）已停用。
 pub const FLAG_PACKET_OUTBOX_DISABLED: u32 = 1 << 0;
@@ -104,6 +104,37 @@ pub struct HealthFrame {
     pub timeout_count: u64,
     /// 当前被放弃的 IO 任务数。
     pub abandoned_tasks: u64,
+    /// packetLength 异常被丢弃的包数（协议 v2 新增，诊断用）。
+    ///
+    /// 排查「钩子挂对了但收不到包」时最关键的一个数：非 0 说明读到的长度
+    /// 字段不可信，包在边界检查之前就被丢弃了。
+    pub invalid_length: u64,
+    /// 转发过程中的异常次数（IO/解压/格式），诊断用。
+    pub forward_errors: u64,
+    /// 钩子进入网络包路径的次数（startIndex==6 且长度合法）。
+    pub hook_entered: u64,
+    /// 包起始魔数不匹配的次数（7.2 若改包格式，这个会飙升）。
+    pub bad_magic: u64,
+    /// 通过魔数校验但 TryGetData 失败的次数（多为解压失败）。
+    pub try_get_data_fail: u64,
+    /// 成功提取包体并转发的次数。
+    pub accepted: u64,
+    /// 当前订阅的 cmdId 数量（0 说明任务列表没加载）。
+    pub required_count: u64,
+    /// 因 cmdId 未订阅被过滤的包数。
+    pub filtered: u64,
+    /// 最近被过滤的 cmdId。
+    pub last_filtered_cmd: u64,
+    /// 订阅列表前 8 项快照（协议 v5，确认 LoadTasks 实际内容）。
+    pub required_sample: [u64; 8],
+    /// 最近见到的 cmdId 环形缓冲（协议 v6）。
+    pub cmd_seen: [u64; 8],
+    /// 已见到的包总数（协议 v6）。
+    pub cmd_seen_total: u64,
+    /// 不同包的原始 8 字节头（协议 v7）。
+    pub raw_header: [u64; 6],
+    /// 第一个包 val+0..+0x28 的 40 字节（协议 v8）。
+    pub probe_len: [u64; 5],
 }
 
 impl HealthFrame {
@@ -113,7 +144,81 @@ impl HealthFrame {
             flags,
             timeout_count,
             abandoned_tasks,
+            invalid_length: 0,
+            forward_errors: 0,
+            hook_entered: 0,
+            bad_magic: 0,
+            try_get_data_fail: 0,
+            accepted: 0,
+            required_count: 0,
+            filtered: 0,
+            last_filtered_cmd: 0,
+            required_sample: [0; 8],
+            cmd_seen: [0; 8],
+            cmd_seen_total: 0,
+            raw_header: [0; 6],
+            probe_len: [0; 5],
         }
+    }
+
+    /// 供 DLL 侧填充诊断计数器。
+    pub const fn with_diagnostics(mut self, invalid_length: u64, forward_errors: u64) -> Self {
+        self.invalid_length = invalid_length;
+        self.forward_errors = forward_errors;
+        self
+    }
+
+    /// 供 DLL 侧填充订阅列表快照（协议 v5）。
+    pub const fn with_required_sample(mut self, sample: [u64; 8]) -> Self {
+        self.required_sample = sample;
+        self
+    }
+
+    /// 供 DLL 侧填充观测到的 cmdId（协议 v6）。
+    pub const fn with_cmd_seen(mut self, seen: [u64; 8], total: u64) -> Self {
+        self.cmd_seen = seen;
+        self.cmd_seen_total = total;
+        self
+    }
+
+    /// 供 DLL 侧填充原始包头（协议 v7）。
+    pub const fn with_raw_header(mut self, raw: [u64; 6]) -> Self {
+        self.raw_header = raw;
+        self
+    }
+
+    /// 供 DLL 侧填充首包探针（协议 v8）。
+    pub const fn with_probe_len(mut self, probe: [u64; 5]) -> Self {
+        self.probe_len = probe;
+        self
+    }
+
+    /// 供 DLL 侧填充过滤阶段的计数（协议 v4）。
+    pub const fn with_filter(
+        mut self,
+        required_count: u64,
+        filtered: u64,
+        last_filtered_cmd: u64,
+    ) -> Self {
+        self.required_count = required_count;
+        self.filtered = filtered;
+        self.last_filtered_cmd = last_filtered_cmd;
+        self
+    }
+
+    /// 供 DLL 侧填充转发流水线各阶段的计数（协议 v3）。
+    pub const fn with_pipeline(
+        mut self,
+        hook_entered: u64,
+        bad_magic: u64,
+        try_get_data_fail: u64,
+        accepted: u64,
+    ) -> Self {
+        self.hook_entered = hook_entered;
+        self.bad_magic = bad_magic;
+        self.try_get_data_fail = try_get_data_fail;
+        self.accepted = accepted;
+        self
     }
 
     /// 聊天发送队列是否已停用（「静默」的核心信号）。
@@ -208,6 +313,32 @@ pub fn encode_health(frame: &HealthFrame) -> [u8; FRAME_SIZE] {
     out[8..12].copy_from_slice(&frame.flags.to_le_bytes());
     out[12..20].copy_from_slice(&frame.timeout_count.to_le_bytes());
     out[20..28].copy_from_slice(&frame.abandoned_tasks.to_le_bytes());
+    out[28..36].copy_from_slice(&frame.invalid_length.to_le_bytes());
+    out[36..44].copy_from_slice(&frame.forward_errors.to_le_bytes());
+    out[44..52].copy_from_slice(&frame.hook_entered.to_le_bytes());
+    out[52..60].copy_from_slice(&frame.bad_magic.to_le_bytes());
+    out[60..68].copy_from_slice(&frame.try_get_data_fail.to_le_bytes());
+    out[68..76].copy_from_slice(&frame.accepted.to_le_bytes());
+    out[76..84].copy_from_slice(&frame.required_count.to_le_bytes());
+    out[84..92].copy_from_slice(&frame.filtered.to_le_bytes());
+    out[92..100].copy_from_slice(&frame.last_filtered_cmd.to_le_bytes());
+    for (i, value) in frame.required_sample.iter().enumerate() {
+        let at = 100 + i * 8;
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    for (i, value) in frame.cmd_seen.iter().enumerate() {
+        let at = 164 + i * 8;
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    out[228..236].copy_from_slice(&frame.cmd_seen_total.to_le_bytes());
+    for (i, value) in frame.raw_header.iter().enumerate() {
+        let at = 236 + i * 8;
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    for (i, value) in frame.probe_len.iter().enumerate() {
+        let at = 284 + i * 8;
+        out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
     out
 }
 
@@ -249,12 +380,48 @@ pub fn parse_health(bytes: &[u8]) -> Result<Option<HealthFrame>, HealthError> {
     if bytes.len() < FRAME_SIZE {
         return Ok(None);
     }
-    Ok(Some(HealthFrame::new(
-        u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-        u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-        u64::from_le_bytes(bytes[12..20].try_into().expect("FRAME_SIZE 已保证长度")),
-        u64::from_le_bytes(bytes[20..28].try_into().expect("FRAME_SIZE 已保证长度")),
-    )))
+    Ok(Some(
+        HealthFrame::new(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            u64::from_le_bytes(bytes[12..20].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[20..28].try_into().expect("FRAME_SIZE 已保证长度")),
+        )
+        .with_diagnostics(
+            u64::from_le_bytes(bytes[28..36].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[36..44].try_into().expect("FRAME_SIZE 已保证长度")),
+        )
+        .with_pipeline(
+            u64::from_le_bytes(bytes[44..52].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[52..60].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[60..68].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[68..76].try_into().expect("FRAME_SIZE 已保证长度")),
+        )
+        .with_filter(
+            u64::from_le_bytes(bytes[76..84].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[84..92].try_into().expect("FRAME_SIZE 已保证长度")),
+            u64::from_le_bytes(bytes[92..100].try_into().expect("FRAME_SIZE 已保证长度")),
+        )
+        .with_required_sample(std::array::from_fn(|i| {
+            let at = 100 + i * 8;
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("FRAME_SIZE 已保证长度"))
+        }))
+        .with_cmd_seen(
+            std::array::from_fn(|i| {
+                let at = 164 + i * 8;
+                u64::from_le_bytes(bytes[at..at + 8].try_into().expect("FRAME_SIZE 已保证长度"))
+            }),
+            u64::from_le_bytes(bytes[228..236].try_into().expect("FRAME_SIZE 已保证长度")),
+        )
+        .with_raw_header(std::array::from_fn(|i| {
+            let at = 236 + i * 8;
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("FRAME_SIZE 已保证长度"))
+        }))
+        .with_probe_len(std::array::from_fn(|i| {
+            let at = 284 + i * 8;
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("FRAME_SIZE 已保证长度"))
+        })),
+    ))
 }
 
 #[cfg(test)]
@@ -267,9 +434,10 @@ mod tests {
 
     #[test]
     fn frame_size_matches_field_widths() {
-        // 2(magic) + 1(version) + 1(kind) + 4(seq) + 4(flags) + 8 + 8 = 28。
-        assert_eq!(FRAME_SIZE, 2 + 1 + 1 + 4 + 4 + 8 + 8);
-        assert_eq!(FRAME_SIZE, 28);
+        // 2(magic)+1(version)+1(kind)+4(seq)+4(flags)+8(timeout)+8(abandoned)
+        // +8(invalid_length)+8(forward_errors) = 44。
+        assert_eq!(FRAME_SIZE, 2 + 1 + 1 + 4 + 4 + 8 * 39);
+        assert_eq!(FRAME_SIZE, 324);
     }
 
     #[test]
@@ -536,7 +704,23 @@ mod tests {
             GOLDEN_FLAGS,
             GOLDEN_TIMEOUT_COUNT,
             GOLDEN_ABANDONED_TASKS,
-        );
+        )
+        .with_diagnostics(GOLDEN_INVALID_LENGTH, GOLDEN_FORWARD_ERRORS)
+        .with_pipeline(
+            GOLDEN_HOOK_ENTERED,
+            GOLDEN_BAD_MAGIC,
+            GOLDEN_TRY_GET_DATA_FAIL,
+            GOLDEN_ACCEPTED,
+        )
+        .with_filter(
+            GOLDEN_REQUIRED_COUNT,
+            GOLDEN_FILTERED,
+            GOLDEN_LAST_FILTERED_CMD,
+        )
+        .with_required_sample(GOLDEN_REQUIRED_SAMPLE)
+        .with_cmd_seen(GOLDEN_CMD_SEEN, GOLDEN_CMD_SEEN_TOTAL)
+        .with_raw_header(GOLDEN_RAW_HEADER)
+        .with_probe_len(GOLDEN_PROBE_LEN);
         assert_eq!(encode_health(&frame), GOLDEN_HEALTH_FRAME);
     }
 }

@@ -117,10 +117,18 @@ pub struct RawChat {
 /// 逐套布局尝试：7.2 与 7.1 的字段号完全不同，命中哪套就用哪套。
 /// 只返回文本消息：表情/附件/系统消息不可能是命令。
 pub fn extract_chats(payload: &[u8]) -> Vec<RawChat> {
+    extract_chats_with(payload, layouts())
+}
+
+/// 同 extract_chats，但用显式传入的布局表。
+///
+/// 存在的理由是**可验证性**：只有把布局当参数，测试才能喂一套「重新编号」的
+/// 布局来证明「游戏改版只改配置即可」，而不是靠读代码相信。
+fn extract_chats_with(payload: &[u8], layouts: &[LayoutSpec]) -> Vec<RawChat> {
     let Ok(root) = proto::parse(payload) else {
         return Vec::new();
     };
-    for layout in layouts() {
+    for layout in layouts {
         let mut out = Vec::new();
         for event in root.repeated_messages(layout.events) {
             let Some(inner) = event.varint(layout.inner_type) else {
@@ -150,8 +158,16 @@ pub fn extract_chats(payload: &[u8]) -> Vec<RawChat> {
 /// 用它会把当前大厅误判成别人大厅的 ID。当前大厅只能由"自己发的消息"
 /// 或人数包确立，见 ChatState::ingest。
 pub fn extract_hall_context(payload: &[u8]) -> Option<(u64, u32)> {
+    extract_hall_context_with(payload, layouts())
+}
+
+/// 同 extract_hall_context，但用显式传入的布局表。
+///
+/// 存在的理由是**可验证性**：只有把布局当参数，测试才能喂一套「重新编号」的
+/// 布局来证明「游戏改版只改配置即可」，而不是靠读代码相信。
+fn extract_hall_context_with(payload: &[u8], layouts: &[LayoutSpec]) -> Option<(u64, u32)> {
     let root = proto::parse(payload).ok()?;
-    for layout in layouts() {
+    for layout in layouts {
         for event in root.repeated_messages(layout.events) {
             if event.varint(layout.inner_type) != layout.inner_hall_chat {
                 continue;
@@ -170,8 +186,16 @@ pub fn extract_hall_context(payload: &[u8]) -> Option<(u64, u32)> {
 ///
 /// BOT 长时间不说话时，只能靠它判定当前大厅。
 pub fn extract_population_hall(payload: &[u8]) -> Option<u64> {
+    extract_population_hall_with(payload, layouts())
+}
+
+/// 同 extract_population_hall，但用显式传入的布局表。
+///
+/// 存在的理由是**可验证性**：只有把布局当参数，测试才能喂一套「重新编号」的
+/// 布局来证明「游戏改版只改配置即可」，而不是靠读代码相信。
+fn extract_population_hall_with(payload: &[u8], layouts: &[LayoutSpec]) -> Option<u64> {
     let root = proto::parse(payload).ok()?;
-    for layout in layouts() {
+    for layout in layouts {
         let Some(wanted) = layout.inner_hall_population else {
             continue;
         };
@@ -192,10 +216,18 @@ pub fn extract_population_hall(payload: &[u8]) -> Option<u64> {
 
 /// 从成员快照或资料包提取 uid -> 昵称。
 pub fn extract_names(payload: &[u8]) -> Vec<(u32, String)> {
+    extract_names_with(payload, layouts())
+}
+
+/// 同 extract_names，但用显式传入的布局表。
+///
+/// 存在的理由是**可验证性**：只有把布局当参数，测试才能喂一套「重新编号」的
+/// 布局来证明「游戏改版只改配置即可」，而不是靠读代码相信。
+fn extract_names_with(payload: &[u8], layouts: &[LayoutSpec]) -> Vec<(u32, String)> {
     let Ok(root) = proto::parse(payload) else {
         return Vec::new();
     };
-    for layout in layouts() {
+    for layout in layouts {
         // 7.2 起 uid -> 昵称的唯一可靠来源是好友列表（事件 24893，#8 重复，#1 uid，#4 昵称）。
         if let Some(wanted) = layout.inner_friend_list
             && let Some(names) = names_from_friend_list(&root, layout, wanted)
@@ -282,10 +314,18 @@ pub struct FriendProfile {
 
 /// 从信封里提取好友档案（含备注）。
 pub fn extract_friend_profiles(payload: &[u8]) -> Vec<FriendProfile> {
+    extract_friend_profiles_with(payload, layouts())
+}
+
+/// 同 extract_friend_profiles，但用显式传入的布局表。
+///
+/// 存在的理由是**可验证性**：只有把布局当参数，测试才能喂一套「重新编号」的
+/// 布局来证明「游戏改版只改配置即可」，而不是靠读代码相信。
+fn extract_friend_profiles_with(payload: &[u8], layouts: &[LayoutSpec]) -> Vec<FriendProfile> {
     let Ok(root) = proto::parse(payload) else {
         return Vec::new();
     };
-    for layout in layouts() {
+    for layout in layouts {
         let Some(wanted) = layout.inner_friend_list else {
             continue;
         };
@@ -566,7 +606,173 @@ mod tests {
         assert!(extract_chats(&hb).is_empty());
     }
 
-    /// 按 wire format 拼一段 protobuf：用于构造测试样本。
+    // ---- 配置驱动性的证明 ---------------------------------------------
+
+    /// 把一套布局的**所有**字段号整体换掉，模拟下一次游戏改版。
+    ///
+    /// 只动数字、不动代码——如果解析仍然正确，就说明「更新只改配置」成立。
+    fn renumbered(layout: &LayoutSpec) -> LayoutSpec {
+        let mut next = layout.clone();
+        next.id = "renumbered".to_owned();
+        next.events += 9;
+        next.inner_type += 5;
+        next.payload += 7;
+        next.body_hall += 1;
+        next.body_private += 2;
+        next.ts += 3;
+        next.from_uid += 4;
+        next.to_uid += 8;
+        next.text += 70;
+        next.hall_ctx += 6;
+        next.hall_type += 9;
+        next.hall_id += 11;
+        next.population_hall += 13;
+        next.record_list += 17;
+        next.record_uid += 19;
+        next.record_name += 23;
+        next.record_remark += 29;
+        next.member_list += 31;
+        next.member_uid += 37;
+        next.member_name += 41;
+        next.inner_hall_chat = next.inner_hall_chat.map(|v| v + 1000);
+        next.inner_private_chat = next.inner_private_chat.map(|v| v + 2000);
+        next.inner_private_history = next.inner_private_history.map(|v| v + 3000);
+        next.inner_hall_population = next.inner_hall_population.map(|v| v + 4000);
+        next.inner_hall_members = next.inner_hall_members.map(|v| v + 5000);
+        next.inner_friend_list = next.inner_friend_list.map(|v| v + 6000);
+        next
+    }
+
+    #[test]
+    fn config_only_remap_is_enough_for_next_game_version() {
+        // 这条用例是 1.0 的核心承诺：游戏改版后**只改 game-config.json 的字段号**，
+        // 不用改代码。所以这里把全部字段号重排一遍，再按重排后的编号造包。
+        let base = crate::game_config::default_config().layouts[0].clone();
+        let l = renumbered(&base);
+        let layouts = [l.clone()];
+
+        const HALL_ID: u64 = 500_000_000_000_000_001;
+        const UID: u64 = 100_000_001;
+
+        // 大厅聊天 + 大厅上下文
+        let hall_packet = fb_for_test(
+            l.events,
+            &concat_for_test(&[
+                fv_for_test(l.inner_type, l.inner_hall_chat.expect("大厅聊天类型")),
+                fb_for_test(
+                    l.payload,
+                    &concat_for_test(&[
+                        fb_for_test(
+                            l.hall_ctx,
+                            &concat_for_test(&[
+                                fv_for_test(l.hall_type, 16),
+                                fv_for_test(l.hall_id, HALL_ID),
+                            ]),
+                        ),
+                        fb_for_test(
+                            l.body_hall,
+                            &concat_for_test(&[
+                                fv_for_test(l.from_uid, UID),
+                                fv_for_test(l.ts, 1_793_770_092),
+                                fb_for_test(l.text, "改版后的消息".as_bytes()),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+        let chats = extract_chats_with(&hall_packet, &layouts);
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].text, "改版后的消息");
+        assert_eq!(chats[0].from_uid, 100_000_001);
+        assert_eq!(chats[0].hall_id, Some(HALL_ID));
+        assert_eq!(chats[0].hall_type, Some(16));
+
+        // 实时私聊
+        let private_packet = fb_for_test(
+            l.events,
+            &concat_for_test(&[
+                fv_for_test(l.inner_type, l.inner_private_chat.expect("私聊类型")),
+                fb_for_test(
+                    l.payload,
+                    &fb_for_test(
+                        l.body_private,
+                        &concat_for_test(&[
+                            fv_for_test(l.from_uid, 100_000_002),
+                            fv_for_test(l.ts, 1_793_770_093),
+                            fv_for_test(l.to_uid, UID),
+                            fb_for_test(l.text, "私聊".as_bytes()),
+                        ]),
+                    ),
+                ),
+            ]),
+        );
+        let privs = extract_chats_with(&private_packet, &layouts);
+        assert_eq!(privs.len(), 1);
+        assert!(privs[0].is_private);
+        assert_eq!(privs[0].to_uid, Some(100_000_001));
+
+        // 好友列表（昵称 + 备注）
+        let friend_packet = fb_for_test(
+            l.events,
+            &concat_for_test(&[
+                fv_for_test(l.inner_type, l.inner_friend_list.expect("好友列表类型")),
+                fb_for_test(
+                    l.payload,
+                    &fb_for_test(
+                        l.record_list,
+                        &concat_for_test(&[
+                            fv_for_test(l.record_uid, 100_000_003),
+                            fb_for_test(l.record_name, "改版玩家".as_bytes()),
+                            fb_for_test(l.record_remark, "改版备注".as_bytes()),
+                        ]),
+                    ),
+                ),
+            ]),
+        );
+        assert_eq!(
+            extract_names_with(&friend_packet, &layouts),
+            vec![(100_000_003, "改版玩家".to_owned())]
+        );
+        let profiles = extract_friend_profiles_with(&friend_packet, &layouts);
+        assert_eq!(profiles[0].remark.as_deref(), Some("改版备注"));
+
+        // 大厅成员
+        let member_packet = fb_for_test(
+            l.events,
+            &concat_for_test(&[
+                fv_for_test(l.inner_type, l.inner_hall_members.expect("成员列表类型")),
+                fb_for_test(
+                    l.payload,
+                    &fb_for_test(
+                        l.member_list,
+                        &concat_for_test(&[
+                            fv_for_test(l.member_uid, 100_000_004),
+                            fb_for_test(l.member_name, "成员甲".as_bytes()),
+                        ]),
+                    ),
+                ),
+            ]),
+        );
+        assert_eq!(
+            extract_names_with(&member_packet, &layouts),
+            vec![(100_000_004, "成员甲".to_owned())]
+        );
+
+        // 大厅 id 补充包
+        let population_packet = fb_for_test(
+            l.events,
+            &concat_for_test(&[
+                fv_for_test(l.inner_type, l.inner_hall_population.expect("大厅 id 类型")),
+                fb_for_test(l.payload, &fv_for_test(l.population_hall, HALL_ID)),
+            ]),
+        );
+        assert_eq!(
+            extract_population_hall_with(&population_packet, &layouts),
+            Some(HALL_ID)
+        );
+    }
+
     // ---- 7.2 负向用例（只维护当前版本）--------------------------------
 
     #[test]

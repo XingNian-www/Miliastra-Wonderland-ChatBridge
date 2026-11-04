@@ -8,7 +8,7 @@ namespace MiliastraWonderlandChatBridge;
 /// 健康上报通道（第四条命名管道，可选增强）。
 ///
 /// 宿主是 server，DLL 是 client：管道名 <see cref="PipeName"/>，方向 DLL→宿主。
-/// 每 <see cref="HeartbeatIntervalMs"/> 写一帧固定 28 字节小端心跳，让宿主能区分
+/// 每 <see cref="HeartbeatIntervalMs"/> 写一帧固定 324 字节小端心跳，让宿主能区分
 /// 「DLL 静默」和「DLL 活着但已停止转发」（尤其 <see cref="PacketOutbox.Disable"/> 之后）。
 ///
 /// 三条铁律：
@@ -17,7 +17,7 @@ namespace MiliastraWonderlandChatBridge;
 /// 2. 绝不阻塞游戏线程：所有连接/写入/退避都在独立后台线程。
 /// 3. 异常绝不逃逸：NativeAOT 下未处理异常会直接终止游戏进程，ReporterLoop 全程兜底。
 ///
-/// 帧格式（与宿主 src/health.rs 对齐，固定 28 字节小端）：
+/// 帧格式（与宿主 src/health.rs 对齐，固定 324 字节小端）：
 ///   magic u16 = 0x4D57, version u8 = 1, kind u8 = 0x01,
 ///   seq u32, flags u32,
 ///   timeout_count u64, abandoned_tasks u64。

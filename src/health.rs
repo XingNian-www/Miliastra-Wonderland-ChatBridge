@@ -311,7 +311,7 @@ pub fn pack_flags(
     flags
 }
 
-/// 编码一帧固定 28 字节（小端）。
+/// 编码一帧固定 324 字节（小端）。
 ///
 /// 无长度字段：写端必须一次写满 `FRAME_SIZE` 字节，或按字节流顺序写；
 /// 读端按 `FRAME_SIZE` 切片解析。
@@ -361,7 +361,7 @@ pub fn encode_health(frame: &HealthFrame) -> [u8; FRAME_SIZE] {
 /// - `Err(HealthError)`：前缀已确定不合法（magic/version/kind），致命错误。
 ///
 /// magic/version/kind 的校验是增量的：只要收到的字节已经能判定错误就立即
-/// 返回 `Err`，不会为了凑满 28 字节把垃圾数据长期留在缓冲区。
+/// 返回 `Err`，不会为了凑满 324 字节把垃圾数据长期留在缓冲区。
 pub fn parse_health(bytes: &[u8]) -> Result<Option<HealthFrame>, HealthError> {
     // 1 字节就足以否定 magic 的低字节。
     if let Some(&actual) = bytes.first()
@@ -507,13 +507,13 @@ mod tests {
         for len in 0..FRAME_SIZE {
             assert_eq!(parse_health(&encoded[..len]), Ok(None), "len={len}");
         }
-        // 恰好 28 字节才解析成功。
+        // 恰好 324 字节才解析成功。
         assert_eq!(parse_health(&encoded).unwrap().unwrap(), sample());
     }
 
     #[test]
     fn prefix_errors_are_rejected_without_waiting_for_full_frame() {
-        // 1 字节：低字节就不是 'W'，立即拒绝（不等 28 字节）。
+        // 1 字节：低字节就不是 'W'，立即拒绝（不等 324 字节）。
         assert_eq!(parse_health(&[0x4D]), Err(HealthError::BadMagic(0x004D)));
         // 2 字节：magic 高低写反。低字节先被判错，只报已确认的部分。
         assert_eq!(
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn bad_magic_is_rejected_on_a_full_frame() {
-        // 完整 28 字节里 magic 写错，也必须拒绝（不能因为"看起来够长"就解析）。
+        // 完整 324 字节里 magic 写错，也必须拒绝（不能因为"看起来够长"就解析）。
         let mut encoded = encode_health(&sample());
         encoded[0] = 0x4D;
         assert_eq!(parse_health(&encoded), Err(HealthError::BadMagic(0x004D)));
@@ -624,7 +624,7 @@ mod tests {
             0
         );
 
-        // 连续两帧放在同一缓冲区：按固定 28 字节切分后 seq 回绕仍然连续。
+        // 连续两帧放在同一缓冲区：按固定 324 字节切分后 seq 回绕仍然连续。
         let mut buffer = Vec::new();
         buffer.extend_from_slice(&encode_health(&last));
         buffer.extend_from_slice(&encode_health(&wrapped));

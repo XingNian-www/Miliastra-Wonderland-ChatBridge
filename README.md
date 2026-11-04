@@ -181,9 +181,9 @@ protobuf 字段号**。它们以前分散在代码与 `metadata.bin` 里，现�
 任何一步失败都只降一级，不影响启动：
 
 ```
-INFO  已读取游戏配置缓存: game-config.json（2 个版本，2 套布局）
+INFO  已读取游戏配置缓存: game-config.json（1 个版本，1 套布局）
 WARN  拉取远程游戏配置失败，降级: GET https://raw.githubusercontent.com/... 失败: 404
-INFO  游戏配置来源: 本地缓存（2 个版本，2 套布局，信封 cmdId [24007, 486]）
+INFO  游戏配置来源: 本地缓存（1 个版本，1 套布局，信封 cmdId [24007, 486]）
 ```
 
 ### 文件内容
@@ -210,10 +210,11 @@ INFO  游戏配置来源: 本地缓存（2 个版本，2 套布局，信封 cmdI
     {
       "id": "7.2",
       "events": 12, "innerType": 2, "payload": 14,
-      "bodyHall": 5, "bodyPrivate": 5,
+      "bodyHall": 5, "bodyPrivate": 4,
       "ts": 2, "fromUid": 1, "toUid": 6, "text": 630,
       "hallCtx": 4, "hallType": 1, "hallId": 2, "populationHall": 2,
-      "innerHallChat": 29636, "innerPrivateChat": 25574
+      "innerHallChat": 29636, "innerPrivateChat": 28274,
+      "innerPrivateHistory": 25574
     }
   ]
 }
@@ -223,8 +224,8 @@ INFO  游戏配置来源: 本地缓存（2 个版本，2 套布局，信封 cmdI
 - `versions[].rva`：注入用的函数偏移。**写成十六进制字符串**，与 IDA/Ghidra 里看到的一致；
   反序列化也接受十进制数字，方便脚本生成。
 - `envelope`：要订阅的信封 cmdId（`--cmd` 优先级更高）。
-- `layouts`：聊天包体字段号，**按新到旧排列**，解析时逐套尝试、命中即用，所以新旧版本可以共存。
-  尚未识别的内层事件类型省略或写 `null`，对应功能会优雅降级为返回空。
+- `layouts`：聊天包体字段号。**配置只保留最新版本**；解析仍逐套尝试，
+  所以过渡期同时放多套也不冲突。尚未识别的内层事件类型省略或写 `null`，对应功能会优雅降级为返回空。
 
 ### 命令行
 
@@ -257,7 +258,7 @@ https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/m
 
 1. `--diagnose` 看 `游戏 exe: ...（CRC32=0x????????）`，记下新的 CRC32；
 2. 按「游戏大版本更新后的修复顺序」那节定位新的 RVA 与字段号；
-3. 把新条目**追加**到 `versions` / `layouts` 前面，更新 `updatedAt`；
+3. 用新条目**替换** `versions` / `layouts` 里的旧版本（只保留最新），更新 `updatedAt`；
 4. 推到仓库的 `config/game-config.json`；各机器下次启动自动拉取，无需重装。
 
 > **关键区别**：私聊有两个事件，`28274` 是**实时单条**（一条消息一个包），
@@ -323,8 +324,8 @@ curl -X POST http://127.0.0.1:18889/debug/packets \
 
 ### 3. protobuf 字段号
 
-信封内部的字段号同样会整体换掉。代码把差异集中成数据（`src/extract.rs` 里的 `Layout`），
-解析时按 `LAYOUTS` 顺序**逐套尝试，命中即用**，所以新旧版本可以同时支持。
+信封内部的字段号同样会整体换掉。差异集中在 `game-config.json` 的 `layouts` 里，
+解析时按顺序**逐套尝试，命中即用**，所以过渡期同时放多套也不冲突。
 
 | 项 | 7.1 | 7.2 |
 |---|---|---|
@@ -351,13 +352,13 @@ curl -X POST http://127.0.0.1:18889/debug/packets \
 发一条消息，在日志里找**包含明文文本的那段 hex**——文本字段号的 tag 就在它前面
 （`#630` 的 tag 是 `b2 27`）。
 
-拿到全部字段号后，在 `LAYOUTS` **前面**加一条 `LAYOUT_7_3` 即可，其余代码不用动。
+拿到全部字段号后，在 `layouts` 前面加一条新条目即可，其余代码不用动（也不用重新编译）。
 
 ### 4. 回归测试
 
-`src/extract.rs` 的 `extract_72_*` 用例用的是**真机抓到的包**做字节级锚点。
-版本变更时照样子加一组 `extract_73_*`，把新抓包钉进去——
-这样下次再变，测试会立刻指出是哪一层坏了。
+`src/extract.rs` 的 `extract_72_*` 用例用**按真机结构构造、数值已脱敏**的字节夹具做锚点
+（真实包的字段布局，UID/昵称/大厅 id 全部替换为虚构值，避免把玩家数据带进仓库）。
+版本变更时照样子加一组 `extract_73_*`——这样下次再变，测试会立刻指出是哪一层坏了。
 
 ## 许可与致谢
 

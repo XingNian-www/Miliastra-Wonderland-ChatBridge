@@ -16,3 +16,6 @@ docs/*
 
 # 游戏版本配置要随仓库发布，给 *.json 开个例外。
 !config/game-config.json
+
+# 发布产物不入库：里面会带内部文档与本地路径。
+dist/

@@ -32,6 +32,8 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 | GET | `/debug/events` | 最近关键事件（诊断） |
 | GET | `/debug/packets` | 调试包模式快照（诊断/开关） |
 | POST | `/debug/packets` | 切换调试包模式 |
+| GET | `/debug/capture` | 抓包状态（诊断/开关） |
+| POST | `/debug/capture` | 运行期开启/停止抓包、换目录 |
 
 ### GET /
 
@@ -98,7 +100,7 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 
 #### `dll` 对象：DLL 健康心跳
 
-宿主与 DLL 之间除了聊天/调试/控制三条管道，还有一条**健康上报管道**（`MiliastraWonderlandChatBridgeHealth`，DLL→宿主，单向、无 ACK）。DLL 每 1 秒发一帧 28 字节心跳，让宿主能区分「DLL 正常但游戏安静」与「DLL 已出问题」——**只看有没有数据是分不出来的**。
+宿主与 DLL 之间除了聊天/调试/控制三条管道，还有一条**健康上报管道**（`MiliastraWonderlandChatBridgeHealth`，DLL→宿主，单向、无 ACK）。DLL 每 1 秒发一帧 324 字节心跳，让宿主能区分「DLL 正常但游戏安静」与「DLL 已出问题」——**只看有没有数据是分不出来的**。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -114,6 +116,20 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 | `seq` | uint32 | 最近一帧心跳的序号，判丢帧用（回绕语义） |
 | `lostFrames` | uint64 | 按 `seq` 缺口累计的丢帧数（wrapping 语义）。超过 600 帧的跳变按对端重连处理，不计入 |
 | `parseErrors` | uint64 | 心跳帧解析失败次数（通常是 DLL 与宿主协议版本不一致） |
+| `hookEntered` | uint64 | 钩子进入网络包路径的次数 |
+| `badMagic` | uint64 | 包起始魔数不匹配次数；包格式变了会飙升 |
+| `tryGetDataFail` | uint64 | 魔数通过但 TryGetData 失败（多为解压失败） |
+| `invalidLength` | uint64 | packetLength 异常被丢弃的包数 |
+| `forwardErrors` | uint64 | 转发过程异常（IO/解压/格式）次数 |
+| `accepted` | uint64 | 成功提取并转发的包数 |
+| `requiredCount` | uint64 | 当前订阅的 cmdId 数量；0 表示任务列表没加载 |
+| `requiredSample` | uint64[8] | 订阅列表前 8 项快照 |
+| `filtered` | uint64 | 因 cmdId 未订阅被过滤的包数 |
+| `lastFilteredCmd` | uint64 | 最近被过滤的 cmdId |
+| `cmdSeen` | uint64[8] | 最近见到的 cmdId 环形缓冲 |
+| `cmdSeenTotal` | uint64 | 已见到的包总数 |
+| `rawHeader` | uint64[6] | 完整 8 字节包头；64 位表示不到 8 字节时的部分值 |
+| `probeLen` | uint64[5] | 首个包关键区间的原始字节，排查长度字段用 |
 
 `state` 含义：
 
@@ -272,6 +288,33 @@ curl -X POST -H "x-miliastra-token: <token>" -H "Content-Type: application/json"
      -d '{"mode":"all"}' http://127.0.0.1:18889/debug/packets
 ```
 
+### GET /debug/capture
+
+返回抓包状态。抓包可**运行期开启**，不需要为了 `--capture-dir` 重启进程：
+
+```json
+{
+  "ok": true,
+  "active": true,
+  "defaultDir": "C:/path/to/capture",
+  "capture": { "enabled": true, "dir": "C:/path/to/capture", "maxBytes": 536870912, "files": 120, "bytes": 34000, "dropped": 0, "stopped": false }
+}
+```
+
+### POST /debug/capture
+
+```json
+{ "enabled": true, "dir": "D:/caps", "maxMib": 256 }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `enabled` | bool | 必填；`false` 表示停止（落盘线程退出，已抓的文件保留） |
+| `dir` | string | 可选；省略则用程序同目录的 `capture/` |
+| `maxMib` | uint64 | 可选；落盘总字节上限，省略用默认 512 MiB |
+
+抓到上限或队列满只会丢抓包，不影响聊天。切到 `all` 时会自动按默认目录开启抓包；
+不想要这个行为就加 `--no-auto-capture`。注意开启会**截断**目标目录里的 `index.csv`。
 ### GET /messages
 
 ```http
@@ -319,11 +362,18 @@ GET /names?uids=100000001,100000002
   "names": {
     "100000001": "Alice",
     "100000002": null
+  },
+  "remarks": {
+    "100000001": "老板",
+    "100000002": null
   }
 }
 ```
 
 昵称未知时为 `null`；消息身份与权限判断应使用 UID。昵称后续更新不会修改已缓存消息。
+
+`remarks` 是好友**备注**（玩家自己起的名字，可能与昵称不同），只有设过备注的好友才有；
+它和昵称分开返回，不能互相替代——备注可以随时改写，不能用于身份判断。
 
 ### WebSocket /stream
 

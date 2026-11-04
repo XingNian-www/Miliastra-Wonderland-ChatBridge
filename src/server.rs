@@ -446,11 +446,16 @@ async fn debug_packets_set(
         }
     };
     // 切到 ALL 就顺手把抓包打开：省掉「为了抓包重启一次」这个步骤。
-    let capture_dir = if mode == PacketMode::All {
-        state.packets.ensure_capture_for_all()
+    // 切回 chat 则把「自动开的」抓包收掉——不对称收尾会让抓包在 chat 模式下
+    // 一直挂着，用户以为已经停了。手工开的（POST /debug/capture）不受影响。
+    if mode == PacketMode::All {
+        state.packets.ensure_capture_for_all();
     } else {
-        None
-    };
+        state.packets.stop_auto_capture();
+    }
+    // 抓包目录永远按「当前是否在抓」返回：之前只在本次新开抓包时给值，
+    // 已在进行时返回 null，调用方会误以为没在抓。
+    let capture_dir = state.packets.capture_dir();
     Json(json!({
         "ok": true,
         "mode": mode.as_str(),

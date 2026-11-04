@@ -104,6 +104,11 @@ pub struct PacketControl {
     capture: Mutex<Option<CaptureSink>>,
     /// 切到 ALL 时是否自动开抓包。默认开；--no-auto-capture 或测试里关掉。
     auto_capture: AtomicBool,
+    /// 当前抓包是不是「切到 ALL 时自动开的」。
+    ///
+    /// 用来对称收尾：自动开的，切回 chat 就自动停；手工开的（POST /debug/capture）
+    /// 不动，否则用户以为自己开的抓包被悄悄关掉了。
+    auto_started: AtomicBool,
 }
 
 impl PacketControl {
@@ -124,6 +129,7 @@ impl PacketControl {
             bytes: AtomicU64::new(0),
             capture: Mutex::new(capture),
             auto_capture: AtomicBool::new(true),
+            auto_started: AtomicBool::new(false),
         })
     }
 
@@ -184,6 +190,16 @@ impl PacketControl {
     /// 好处是不用为了带 --capture-dir 重启进程：切到 ALL 就自动抓，
     /// 也可以在这里改目录重新开始。
     pub fn start_capture(&self, dir: Option<PathBuf>, max_bytes: u64) -> Result<PathBuf, String> {
+        self.start_capture_with(dir, max_bytes, false)
+    }
+
+    /// auto 表示这次是切到 ALL 时顺手开的，切回 chat 会自动停。
+    fn start_capture_with(
+        &self,
+        dir: Option<PathBuf>,
+        max_bytes: u64,
+        auto: bool,
+    ) -> Result<PathBuf, String> {
         let max_bytes = if max_bytes == 0 {
             DEFAULT_CAPTURE_MAX_BYTES
         } else {
@@ -200,6 +216,7 @@ impl PacketControl {
         }) {
             Ok(sink) => {
                 *guard = Some(sink);
+                self.auto_started.store(auto, Ordering::Relaxed);
                 Ok(dir)
             }
             Err(error) => Err(format!("{error:#}")),
@@ -209,7 +226,27 @@ impl PacketControl {
     /// 停止抓包并等待落盘线程退出。返回之前是否在抓。
     pub fn stop_capture(&self) -> bool {
         let mut guard = lock(&self.capture);
-        guard.take().is_some()
+        let stopped = guard.take().is_some();
+        self.auto_started.store(false, Ordering::Relaxed);
+        stopped
+    }
+
+    /// 当前抓包目录（没在抓则 None）。
+    ///
+    /// 切模式时若抓包已在进行，响应里也要给出目录，
+    /// 否则 captureDir=null 会让调用方误以为没在抓。
+    pub fn capture_dir(&self) -> Option<PathBuf> {
+        lock(&self.capture)
+            .as_ref()
+            .map(|sink| sink.shared.dir.clone())
+    }
+
+    /// 切回 chat 时调用：只停自动开的抓包，手工开的保留。
+    pub fn stop_auto_capture(&self) -> bool {
+        if !self.auto_started.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.stop_capture()
     }
 
     /// 切到 ALL 时确保抓包已开（用默认目录）。已开则不动。
@@ -229,7 +266,7 @@ impl PacketControl {
         if lock(&self.capture).is_some() {
             return None;
         }
-        match self.start_capture(None, DEFAULT_CAPTURE_MAX_BYTES) {
+        match self.start_capture_with(None, DEFAULT_CAPTURE_MAX_BYTES, true) {
             Ok(dir) => {
                 tracing::info!("已自动开启 raw 抓包：{}", dir.display());
                 Some(dir)
@@ -333,7 +370,20 @@ impl CaptureSink {
     fn start(config: CaptureConfig) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.dir)?;
         // 每次启动重建索引，避免和上一次运行的 seq 混在一起。
+        // 但旧索引先改名保留：raw 文件还在目录里，直接 truncate 会让它们失去索引，
+        // 变成一堆无法对应 cmd 的孤儿 bin。
         let index_path = config.dir.join("index.csv");
+        if index_path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            let archived = config.dir.join(format!("index-{stamp}.csv"));
+            match std::fs::rename(&index_path, &archived) {
+                Ok(()) => tracing::info!("旧抓包索引已归档：{}", archived.display()),
+                Err(error) => tracing::warn!("归档旧抓包索引失败（将覆盖）：{error}"),
+            }
+        }
         let index = OpenOptions::new()
             .create(true)
             .write(true)
@@ -597,5 +647,69 @@ mod tests {
         assert_eq!(snapshot["counts"]["cmds"]["3347"]["count"], 2);
         assert_eq!(snapshot["counts"]["cmds"]["3347"]["bytes"], 15);
         assert_eq!(snapshot["counts"]["cmds"]["4410"]["count"], 1);
+    }
+    #[test]
+    fn auto_capture_stops_when_leaving_all_mode() {
+        let dir = temp_dir("autostop");
+        let control = PacketControl::new(PacketMode::Chat, None);
+        assert!(!control.capture_active());
+        // 切 ALL：自动开抓包，并记成「自动开的」。
+        let started = control.ensure_capture_for_all();
+        assert!(started.is_some());
+        assert!(control.capture_active());
+        assert_eq!(control.capture_dir(), started);
+        // 切回 chat：自动收掉。
+        assert!(control.stop_auto_capture());
+        assert!(!control.capture_active());
+        assert_eq!(control.capture_dir(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_capture_survives_leaving_all_mode() {
+        let dir = temp_dir("manualkeep");
+        let control = PacketControl::new(PacketMode::All, None);
+        // 手工开（POST /debug/capture）：不能被 stop_auto_capture 关掉。
+        let started = control.start_capture(Some(dir.clone()), 1024).unwrap();
+        assert_eq!(started, dir);
+        assert!(!control.stop_auto_capture(), "手工抓包不该被自动收尾关掉");
+        assert!(control.capture_active());
+        assert_eq!(control.capture_dir(), Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restarting_capture_archives_previous_index() {
+        let dir = temp_dir("archive");
+        {
+            let control = PacketControl::new(PacketMode::All, None);
+            control
+                .start_capture(Some(dir.clone()), 1024 * 1024)
+                .unwrap();
+            control.observe_debug_packet(3347, &[1, 2, 3]);
+            // 停抓包让 writer 落盘。
+            assert!(control.stop_capture());
+        }
+        let first_index = std::fs::read_to_string(dir.join("index.csv")).unwrap();
+        assert!(first_index.contains(",3347,3,"));
+
+        // 再开一次：旧索引应被改名保留，而不是被清掉。
+        {
+            let control = PacketControl::new(PacketMode::All, None);
+            control
+                .start_capture(Some(dir.clone()), 1024 * 1024)
+                .unwrap();
+            assert!(control.stop_capture());
+        }
+        let archived: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("index-") && name.ends_with(".csv"))
+            .collect();
+        assert_eq!(archived.len(), 1, "旧索引应归档一份，实际 {archived:?}");
+        let archived_body = std::fs::read_to_string(dir.join(&archived[0])).unwrap();
+        assert!(archived_body.contains(",3347,3,"), "归档内容应保留旧记录");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

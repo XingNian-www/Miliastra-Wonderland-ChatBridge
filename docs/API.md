@@ -313,8 +313,12 @@ curl -X POST -H "x-miliastra-token: <token>" -H "Content-Type: application/json"
 | `dir` | string | 可选；省略则用程序同目录的 `capture/` |
 | `maxMib` | uint64 | 可选；落盘总字节上限，省略用默认 512 MiB |
 
-抓到上限或队列满只会丢抓包，不影响聊天。切到 `all` 时会自动按默认目录开启抓包；
-不想要这个行为就加 `--no-auto-capture`。注意开启会**截断**目标目录里的 `index.csv`。
+抓到上限或队列满只会丢抓包，不影响聊天。切到 `all` 时会自动按默认目录开启抓包，
+切回 `chat` 时**自动收掉这份自动开的抓包**（手工开的保留）。不想要自动开抓包就加 `--no-auto-capture`。
+
+开始抓包时若目录里已有非空的 `index.csv`，会先改名成 `index-<时间戳>.csv` 保留，不会让上一轮的 raw 文件变成没有索引的孤儿。
+
+无论本次是否新开抓包，响应里的 `captureDir` 都反映**当前实际抓包目录**（没在抓才是 null）。
 ### GET /messages
 
 ```http

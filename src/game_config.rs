@@ -299,7 +299,7 @@ pub fn default_config() -> GameConfig {
     GameConfig {
         schema: SCHEMA.to_owned(),
         updated_at: Some("2026-11-04T04:30:00Z".to_owned()),
-        envelope: vec![24007, 486],
+        envelope: vec![24007],
         versions: vec![GameVersion {
             game_version: "7.2.0".to_owned(),
             exe_crc32: "8cb60f3d".to_owned(),

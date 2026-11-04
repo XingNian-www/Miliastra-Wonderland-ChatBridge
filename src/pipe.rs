@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn load_tasks_reply_subscribes_envelope_and_direct_private() {
+    fn load_tasks_reply_subscribes_envelope_only() {
         let reply = reply(&Frame::LoadTasks, &sample_rva());
         let mut expected = Vec::new();
         for cmd in crate::extract::WANTED_CMDS {
@@ -195,8 +195,8 @@ mod tests {
         }
         expected.extend(u32::MAX.to_le_bytes());
         assert_eq!(reply, expected);
-        // 私聊是独立 cmd 486；只订阅信封会收不到好友消息。
-        assert!(crate::extract::WANTED_CMDS.contains(&486));
+        // 7.2 的私聊已并进信封（内层 28274），不再有独立的 486 直连通道。
+        assert!(!crate::extract::WANTED_CMDS.contains(&486));
         assert!(crate::extract::WANTED_CMDS.contains(&crate::extract::CMD_ENVELOPE));
     }
 

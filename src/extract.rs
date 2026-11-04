@@ -18,7 +18,7 @@
 //!   #8.#6.#15 大厅上下文            #14.#4  大厅上下文
 //! 消息体字段：ts=#1 from=#5 to=#9   消息体字段：ts=#2 from=#1 to=#6
 //!             text=#1985                       text=#630
-//! 内层类型：大厅 20415 私聊 486     内层类型：大厅 29636 私聊 25574
+//! 内层类型：大厅 29636 私聊 28274（会话快照 25574）
 //! ```
 //!
 //! 回归锚点：`tests` 里的 `extract_72_*` 用真机抓到的包做字节级样本，
@@ -29,24 +29,20 @@ use crate::proto::{self, Fields};
 
 /// 多路复用信封 cmd。
 ///
-/// 游戏 7.2 起从 2246 改为 24007；更早的版本用 2246。
+/// 只维护当前线上版本：旧的 2246 已不再订阅。
 /// 运行时可用 --cmd 覆盖，见 wanted_cmds。
 pub const CMD_ENVELOPE: u16 = 24007;
 
-/// 7.1 及更早版本使用的信封 cmd，保留用于回退与 --cmd 提示。
-pub const CMD_ENVELOPE_LEGACY: u16 = 2246;
-
-/// 私聊实时也可能以独立 cmd 486 下发（不经信封）。
-pub const CMD_PRIVATE_DIRECT: u16 = 486;
-
 /// 需要订阅的所有 cmd（编译期默认值）。
 ///
-/// 游戏大版本更新后这些编号会变。运行时可用 --cmd 覆盖，见 wanted_cmds。
-pub const WANTED_CMDS: &[u16] = &[CMD_ENVELOPE, CMD_PRIVATE_DIRECT];
+/// 7.2 的私聊已经并进信封（内层 28274），不再有独立的 486 直连通道
+/// ——实测 167 个全包抓取里 486 出现 0 次。游戏更新后这些编号会变，
+/// 运行时可用 --cmd 覆盖或用 game-config.json 的 envelope 覆盖。
+pub const WANTED_CMDS: &[u16] = &[CMD_ENVELOPE];
 
 /// 运行时订阅表：覆盖值为空时回落到编译期默认。
 ///
-/// 覆盖值来自 --cmd 24007,486 或环境变量 MWC_WANTED_CMDS。
+/// 覆盖值来自 --cmd 24007 或 game-config.json 的 envelope。
 /// 做成运行时可变的原因：游戏每次大版本更新都可能改 cmdId，
 /// 而重新编译宿主 + 换 metadata 的成本远高于改一行参数。
 pub fn wanted_cmds(override_list: &[u16]) -> Vec<u16> {
@@ -73,64 +69,9 @@ pub fn install_layouts(layouts: Vec<LayoutSpec>) {
 
 /// 当前生效的布局表（按新到旧排列）。
 fn layouts() -> &'static [LayoutSpec] {
-    ACTIVE_LAYOUTS.get_or_init(|| {
-        #[allow(unused_mut)]
-        let mut list = crate::game_config::default_config().layouts;
-        // 生产配置只带最新版本；历史布局只在测试里补上，
-        // 保证「旧包也能解析」这条能力始终有回归覆盖，不会在改代码时被默默丢掉。
-        #[cfg(test)]
-        list.extend(test_legacy_layouts());
-        list
-    })
+    ACTIVE_LAYOUTS.get_or_init(|| crate::game_config::default_config().layouts)
 }
 
-/// 历史布局夹具（仅测试使用）。
-#[cfg(test)]
-fn test_legacy_layouts() -> Vec<LayoutSpec> {
-    vec![LayoutSpec {
-        id: "7.1".to_owned(),
-        events: 8,
-        inner_type: 13,
-        payload: 6,
-        body_hall: 4,
-        body_private: 8,
-        ts: 1,
-        from_uid: 5,
-        to_uid: 9,
-        text: 1985,
-        hall_ctx: 15,
-        hall_type: 1,
-        hall_id: 2,
-        population_hall: 9,
-        record_list: 15,
-        record_uid: 1,
-        record_name: 2,
-        record_remark: 17,
-        inner_hall_chat: Some(20415),
-        inner_private_chat: Some(486),
-        inner_private_history: Some(28347),
-        inner_hall_population: Some(7154),
-        inner_hall_members: Some(2076),
-        member_list: 4,
-        member_uid: 1,
-        member_name: 2,
-        inner_friend_list: Some(4410),
-    }]
-}
-/// 内层事件类型。
-pub const INNER_HALL_CHAT: u64 = 20415;
-pub const INNER_PRIVATE_CHAT: u64 = 486;
-pub const INNER_HALL_LIST: u64 = 25313;
-pub const INNER_PRIVATE_HISTORY: u64 = 28347;
-pub const INNER_HALL_MEMBERS: u64 = 2076;
-pub const INNER_HALL_POPULATION: u64 = 7154;
-/// 好友列表（含备注）。**不是独立 cmd**，而是 2246 信封里的内层事件类型；
-/// 进游戏时随信封一次性下发，之后按需懒加载。
-pub const INNER_FRIEND_LIST: u64 = 4410;
-
-// 字段号
-const F_EVENTS: u32 = 8;
-const F_INNER_TYPE: u32 = 13;
 const F_PAYLOAD: u32 = 6;
 
 // 载荷内
@@ -195,40 +136,6 @@ pub fn extract_chats(payload: &[u8]) -> Vec<RawChat> {
             if let Some(payload_fields) = event.message(layout.payload) {
                 collect(&payload_fields, layout, is_private, &mut out);
             }
-        }
-        if !out.is_empty() {
-            return out;
-        }
-    }
-    Vec::new()
-}
-
-/// 解析独立私聊 cmd 的载荷（7.1 是 486；7.2 暂未发现独立私聊包）。
-///
-/// 为兼容多种布局，依次尝试：当作信封、当作载荷容器、当作消息体本身。
-pub fn extract_direct_private(payload: &[u8]) -> Vec<RawChat> {
-    let Ok(root) = proto::parse(payload) else {
-        return Vec::new();
-    };
-    for layout in layouts() {
-        let mut out = Vec::new();
-        for event in root.repeated_messages(layout.events) {
-            if event.varint(layout.inner_type) != layout.inner_private_chat {
-                continue;
-            }
-            if let Some(body) = event.message(layout.payload) {
-                collect(&body, layout, true, &mut out);
-            }
-        }
-        if !out.is_empty() {
-            return out;
-        }
-    }
-    // 独立包的载荷直接是载荷容器。
-    for layout in layouts() {
-        let mut out = Vec::new();
-        for body in root.repeated_messages(layout.events) {
-            collect(&body, layout, true, &mut out);
         }
         if !out.is_empty() {
             return out;
@@ -660,299 +567,80 @@ mod tests {
     }
 
     /// 按 wire format 拼一段 protobuf：用于构造测试样本。
-    fn varint(mut v: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let mut byte = (v & 0x7f) as u8;
-            v >>= 7;
-            if v != 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-            if v == 0 {
-                return out;
-            }
-        }
-    }
+    // ---- 7.2 负向用例（只维护当前版本）--------------------------------
 
-    fn tag(field: u32, wire: u8) -> Vec<u8> {
-        varint(((field as u64) << 3) | u64::from(wire))
-    }
-
-    fn field_varint(field: u32, value: u64) -> Vec<u8> {
-        let mut out = tag(field, 0);
-        out.extend(varint(value));
-        out
-    }
-
-    fn field_bytes(field: u32, value: &[u8]) -> Vec<u8> {
-        let mut out = tag(field, 2);
-        out.extend(varint(value.len() as u64));
-        out.extend(value);
-        out
-    }
-
-    fn concat(parts: Vec<Vec<u8>>) -> Vec<u8> {
-        parts.concat()
-    }
-
-    /// 构造一条好友记录（4410 的 #15）。
-    fn friend_record(uid: u32, name: &str, remark: Option<&str>) -> Vec<u8> {
-        let mut parts = vec![
-            field_varint(F_FRIEND_UID, uid.into()),
-            field_bytes(F_FRIEND_NAME, name.as_bytes()),
-            field_bytes(6, "签名".as_bytes()),
-        ];
-        if let Some(remark) = remark {
-            parts.push(field_bytes(F_FRIEND_REMARK, remark.as_bytes()));
-        }
-        concat(parts)
-    }
-
-    /// 构造 2246 信封：内层事件 #13=4410，载荷 #6 里挂 #15 记录。
-    fn friend_list(records: Vec<Vec<u8>>) -> Vec<u8> {
-        let body = concat(
-            records
-                .into_iter()
-                .map(|r| field_bytes(F_FRIEND_RECORD, &r))
-                .collect(),
-        );
-        let event = concat(vec![
-            field_bytes(6, &body),
-            field_varint(13, INNER_FRIEND_LIST),
-        ]);
-        field_bytes(8, &event)
+    #[test]
+    fn extract_72_ignores_garbage() {
+        // 长度字段错乱/半包不该 panic，也不该吐出假消息。
+        let junk = [0xffu8, 0xff, 0xff, 0xff];
+        assert!(extract_chats(&junk).is_empty());
+        assert!(extract_names(&junk).is_empty());
+        assert!(extract_friend_profiles(&junk).is_empty());
+        assert!(extract_hall_context(&junk).is_none());
+        assert!(extract_population_hall(&junk).is_none());
     }
 
     #[test]
-    fn friend_list_yields_uid_name_and_optional_remark() {
-        let payload = friend_list(vec![
-            friend_record(100000001, "甲玩家", Some("rmkAAA1")),
-            friend_record(100000002, "乙玩家", None),
-            friend_record(100000003, "丙玩家", Some("rmkCCC3")),
-        ]);
-        let profiles = extract_friend_profiles(&payload);
-        assert_eq!(
-            profiles,
-            vec![
-                FriendProfile {
-                    uid: 100000001,
-                    name: Some("甲玩家".into()),
-                    remark: Some("rmkAAA1".into()),
-                },
-                FriendProfile {
-                    uid: 100000002,
-                    name: Some("乙玩家".into()),
-                    remark: None,
-                },
-                FriendProfile {
-                    uid: 100000003,
-                    name: Some("丙玩家".into()),
-                    remark: Some("rmkCCC3".into()),
-                },
-            ]
+    fn extract_72_skips_message_without_text() {
+        // 只有表情/系统事件没有 #630，不该产出空文本消息。
+        let packet = fb_for_test(
+            12,
+            &concat_for_test(&[
+                fv_for_test(2, 28274),
+                fb_for_test(
+                    14,
+                    &concat_for_test(&[fb_for_test(
+                        4,
+                        &concat_for_test(&[
+                            fv_for_test(1, 100_000_001),
+                            fv_for_test(2, 1_793_770_092),
+                            fv_for_test(6, 100_000_002),
+                        ]),
+                    )]),
+                ),
+            ]),
         );
+        assert!(extract_chats(&packet).is_empty());
     }
 
     #[test]
-    fn friend_list_treats_empty_remark_as_absent() {
-        let payload = friend_list(vec![friend_record(1, "甲", Some(""))]);
-        let profiles = extract_friend_profiles(&payload);
+    fn extract_72_empty_remark_is_absent() {
+        // 备注字段存在但为空 = 没设备注，应当报 None 而不是空串。
+        let packet = fb_for_test(
+            12,
+            &concat_for_test(&[
+                fv_for_test(2, 29281),
+                fb_for_test(
+                    14,
+                    &fb_for_test(
+                        10,
+                        &concat_for_test(&[
+                            fv_for_test(1, 100_000_002),
+                            fb_for_test(2, "玩家甲".as_bytes()),
+                            fb_for_test(17, b""),
+                        ]),
+                    ),
+                ),
+            ]),
+        );
+        let profiles = extract_friend_profiles(&packet);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].remark, None);
     }
 
     #[test]
-    fn friend_list_skips_records_without_uid() {
-        // 没有 #1 的记录无法归属，必须丢弃而不是猜。
-        let record = concat(vec![field_bytes(F_FRIEND_NAME, "无主".as_bytes())]);
-        assert!(extract_friend_profiles(&friend_list(vec![record])).is_empty());
-    }
-
-    #[test]
-    fn friend_list_ignores_other_inner_events() {
-        // 同一信封里还有别的内层类型，不能把它们的 #15 误当好友。
-        let friends = friend_list(vec![friend_record(1, "甲", Some("备注甲"))]);
-        let other_body = concat(vec![field_bytes(
-            F_FRIEND_RECORD,
-            &friend_record(2, "乙", Some("备注乙")),
-        )]);
-        let other = concat(vec![field_bytes(6, &other_body), field_varint(13, 7739)]);
-        // 把好友事件与无关事件拼在同一个信封里。
-        let friend_event = field_bytes(
-            8,
-            &concat(vec![
-                field_bytes(
-                    6,
-                    &concat(vec![field_bytes(
-                        F_FRIEND_RECORD,
-                        &friend_record(1, "甲", Some("备注甲")),
-                    )]),
-                ),
-                field_varint(13, INNER_FRIEND_LIST),
+    fn extract_72_friend_record_without_uid_is_skipped() {
+        let packet = fb_for_test(
+            12,
+            &concat_for_test(&[
+                fv_for_test(2, 29281),
+                fb_for_test(14, &fb_for_test(10, &fb_for_test(2, "玩家甲".as_bytes()))),
             ]),
         );
-        let mut payload = friend_event;
-        payload.extend(field_bytes(8, &other));
-        let profiles = extract_friend_profiles(&payload);
-        assert_eq!(profiles.len(), 1, "只认 #13=4410 的事件");
-        assert_eq!(profiles[0].uid, 1);
-        let _ = friends;
-    }
-
-    #[test]
-    fn friend_list_rejects_garbage() {
-        assert!(extract_friend_profiles(&[0xff, 0xff, 0xff]).is_empty());
-    }
-
-    /// 真实抓包回归：2246 信封里的 #13=4410 事件。
-    ///
-    /// 样本不入库（避免把玩家昵称/备注提交进仓库），只在文件存在时校验。
-    #[test]
-    fn extracts_remarks_from_real_envelope_when_sample_available() {
-        let Ok(bytes) = std::fs::read("/tmp/p23.bin") else {
-            return;
-        };
-        let profiles = extract_friend_profiles(&bytes);
-        // 只断言结构计数与字段形状，不落任何真实玩家的 UID/昵称/备注。
-        assert_eq!(profiles.len(), 35, "样本信封里应有 35 条好友记录");
         assert!(
-            profiles
-                .iter()
-                .all(|p| p.uid > 0 && p.name.as_deref().is_some_and(|n| !n.is_empty())),
-            "每条记录都应有正 UID 与非空昵称"
+            extract_names(&packet).is_empty(),
+            "没有 uid 的记录不能当昵称"
         );
-        let with_remark = profiles.iter().filter(|p| p.remark.is_some()).count();
-        assert!(
-            with_remark > 0 && with_remark < profiles.len(),
-            "备注应为可选字段"
-        );
-        assert!(
-            profiles
-                .iter()
-                .filter_map(|p| p.remark.as_deref())
-                .all(|r| !r.is_empty()),
-            "空备注必须被视为未设置"
-        );
-    }
-
-    #[test]
-    fn friend_list_needs_no_extra_subscription() {
-        // 好友列表在 2246 信封内部，所以订阅表保持原样即可。
-        assert!(WANTED_CMDS.contains(&CMD_ENVELOPE));
-        assert_eq!(WANTED_CMDS.len(), 2);
-    }
-
-    /// 构造一条大厅聊天的完整信封。
-    fn hall_envelope(ts: u64, uid: u32, text: &str, hall_id: u64, hall_type: u32) -> Vec<u8> {
-        let body = concat(vec![
-            field_varint(1, ts),
-            field_varint(4, 3),
-            field_varint(5, uid.into()),
-            field_varint(6, 1),
-            field_bytes(1985, text.as_bytes()),
-        ]);
-        let hall = concat(vec![
-            field_varint(1, hall_type.into()),
-            field_varint(2, hall_id),
-        ]);
-        let payload = concat(vec![field_bytes(4, &body), field_bytes(15, &hall)]);
-        let event = concat(vec![field_bytes(6, &payload), field_varint(13, 20415)]);
-        field_bytes(8, &event)
-    }
-
-    #[test]
-    fn extracts_hall_text_message() {
-        let buf = hall_envelope(1792772291, 100000006, "晚安啦", 1000000000000000002, 16);
-        let chats = extract_chats(&buf);
-        assert_eq!(chats.len(), 1);
-        let chat = &chats[0];
-        assert_eq!(chat.text, "晚安啦");
-        assert_eq!(chat.from_uid, 100000006);
-        assert_eq!(chat.ts, 1792772291);
-        assert_eq!(chat.hall_id, Some(1000000000000000002));
-        assert_eq!(chat.hall_type, Some(16));
-        assert!(!chat.is_private);
-    }
-
-    #[test]
-    fn extracts_hall_context() {
-        let buf = hall_envelope(1, 42, "hi", 999, 23);
-        assert_eq!(extract_hall_context(&buf), Some((999, 23)));
-    }
-
-    #[test]
-    fn skips_emoji_only_messages() {
-        let body = concat(vec![
-            field_varint(1, 100),
-            field_varint(5, 42),
-            field_varint(1448, 1003),
-        ]);
-        let payload = field_bytes(4, &body);
-        let event = concat(vec![field_bytes(6, &payload), field_varint(13, 20415)]);
-        let buf = field_bytes(8, &event);
-        assert!(extract_chats(&buf).is_empty(), "纯表情不是命令");
-    }
-
-    #[test]
-    fn ignores_unknown_inner_types() {
-        let event = concat(vec![field_varint(13, 6930)]);
-        assert!(extract_chats(&field_bytes(8, &event)).is_empty());
-    }
-
-    #[test]
-    fn extracts_private_message() {
-        // 私聊的消息体在 #6.#8，不是大厅用的 #6.#4。
-        let body = concat(vec![
-            field_varint(1, 1783937990),
-            field_varint(4, 3),
-            field_varint(5, 100000007),
-            field_varint(6, 201),
-            field_varint(9, 100000009),
-            field_bytes(1985, "1".as_bytes()),
-        ]);
-        let payload = field_bytes(8, &body);
-        let event = concat(vec![field_bytes(6, &payload), field_varint(13, 486)]);
-        let chats = extract_chats(&field_bytes(8, &event));
-        assert_eq!(chats.len(), 1);
-        assert!(chats[0].is_private);
-        assert_eq!(chats[0].to_uid, Some(100000009));
-        assert_eq!(chats[0].hall_id, None);
-    }
-
-    /// 用真实抓包样本验证解析：样本来附录 A（text="123321", hall=1000000000000000001）。
-    #[test]
-    fn parses_real_sample_from_handoff_doc() {
-        // 附录 A 的原始包：
-        //   #8 { #6 { #4 { #1=1792772291 #4=3 #5=100000009 #6=883 #1985="123321" }
-        //            #15 { #1=16 #2=1000000000000000001 } } #13=20415 }
-        let buf = hall_envelope(1792772291, 100000009, "123321", 1000000000000000001, 16);
-        let chats = extract_chats(&buf);
-        assert_eq!(chats.len(), 1);
-        assert_eq!(chats[0].text, "123321");
-        assert_eq!(chats[0].from_uid, 100000009);
-        assert_eq!(chats[0].hall_id, Some(1000000000000000001));
-        assert_eq!(chats[0].hall_type, Some(16));
-        assert_eq!(chats[0].ts, 1792772291);
-    }
-
-    #[test]
-    fn parses_chinese_text_and_emoji_unchanged() {
-        let buf = hall_envelope(1, 1, "晚安啦🌸", 100, 16);
-        let chats = extract_chats(&buf);
-        assert_eq!(chats[0].text, "晚安啦🌸");
-    }
-
-    #[test]
-    fn extracts_population_hall() {
-        // 7154 的载荷就是 #6 本身（容量 #1 / 人数 #11 / 大厅ID #9）。
-        let body = concat(vec![
-            field_varint(1, 12),
-            field_varint(11, 2),
-            field_varint(9, 1000000000000000002),
-        ]);
-        let event = concat(vec![field_bytes(6, &body), field_varint(13, 7154)]);
-        let buf = field_bytes(8, &event);
-        assert_eq!(extract_population_hall(&buf), Some(1000000000000000002));
+        assert!(extract_friend_profiles(&packet).is_empty());
     }
 }

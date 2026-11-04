@@ -2,8 +2,7 @@
   "schema": "miliastra-chatbridge-game-config/v1",
   "updatedAt": "2026-11-04T04:30:00Z",
   "envelope": [
-    24007,
-    486
+    24007
   ],
   "versions": [
     {

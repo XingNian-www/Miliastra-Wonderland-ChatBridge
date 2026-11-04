@@ -183,7 +183,7 @@ protobuf 字段号**。它们以前分散在代码与 `metadata.bin` 里，现�
 ```
 INFO  已读取游戏配置缓存: game-config.json（1 个版本，1 套布局）
 WARN  拉取远程游戏配置失败，降级: GET https://raw.githubusercontent.com/... 失败: 404
-INFO  游戏配置来源: 本地缓存（1 个版本，1 套布局，信封 cmdId [24007, 486]）
+INFO  游戏配置来源: 本地缓存（1 个版本，1 套布局，信封 cmdId [24007]）
 ```
 
 ### 文件内容
@@ -192,7 +192,7 @@ INFO  游戏配置来源: 本地缓存（1 个版本，1 套布局，信封 cmdI
 {
   "schema": "miliastra-chatbridge-game-config/v1",
   "updatedAt": "2026-11-04T04:30:00Z",
-  "envelope": [24007, 486],
+  "envelope": [24007],
   "versions": [
     {
       "gameVersion": "7.2.0",
@@ -302,7 +302,7 @@ https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/m
 先用 `--diagnose` 看当前生效值：
 
 ```
-[INFO] 订阅 cmdId: 24007,486（游戏改版后用 --cmd 覆盖，例如 --cmd 24007,486）
+[INFO] 订阅 cmdId: 24007（游戏改版后用 --cmd 覆盖，例如 --cmd 24007）
 ```
 
 然后用全包模式看实际收到什么：
@@ -319,7 +319,7 @@ curl -X POST http://127.0.0.1:18889/debug/packets \
 **不需要重新编译**：直接加参数覆盖即可。
 
 ```
---cmd 24007,486
+--cmd 24007
 ```
 
 ### 3. protobuf 字段号

@@ -630,7 +630,7 @@ fn diagnose(
         .map(|id| id.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    println!("  [INFO] 订阅 cmdId: {ids}（游戏改版后用 --cmd 覆盖，例如 --cmd 24007,486）");
+    println!("  [INFO] 订阅 cmdId: {ids}（游戏改版后用 --cmd 覆盖，例如 --cmd 24007）");
     let active = crate::game_config::active();
     let crcs = active
         .versions
@@ -704,7 +704,7 @@ fn game_check(
     }
 }
 
-/// 解析 "24007,486" 这样的 cmdId 列表。
+/// 解析 "24007" 或 "24007,486" 这样的 cmdId 列表（逗号分隔）。
 ///
 /// 空项与重复项都被忽略；任一项不是合法 u16 就报错，避免静默订阅到错误编号。
 pub fn parse_cmd_list(value: &str) -> anyhow::Result<Vec<u16>> {
@@ -782,7 +782,7 @@ mod clap_free_args {
         pub no_auto_capture: bool,
         /// 打印内置默认的游戏配置后退出（用于重新生成 config/game-config.json）。
         pub dump_game_config: bool,
-        /// 订阅 cmdId 覆盖（--cmd 24007,486）。空表示用编译期默认。
+        /// 订阅 cmdId 覆盖（--cmd 24007）。空表示用配置里的 envelope。
         ///
         /// 游戏大版本更新常会改聊天信封的 cmdId；有了这个参数就不必重新编译。
         pub wanted_cmds: Vec<u16>,
@@ -833,7 +833,7 @@ mod clap_free_args {
                         token = Some(args.next().context("--token 需要参数")?);
                     }
                     "--cmd" => {
-                        let value = args.next().context("--cmd 需要参数（如 24007,486）")?;
+                        let value = args.next().context("--cmd 需要参数（如 24007）")?;
                         wanted_cmds = super::parse_cmd_list(&value)?;
                     }
                     "--game-config" => {

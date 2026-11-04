@@ -1988,25 +1988,15 @@ fn find_remote_module(pid: u32, dll: &std::path::Path) -> Result<*mut std::ffi::
 }
 
 fn dispatch(chat: &ChatState, cmd: u16, payload: &[u8]) {
-    // 独立 486 只承载私聊；信封 2246 才有多路复用内容。
-    // 好友列表（含备注）也在 2246 信封内部（内层 #13=4410），跟着信封一起解析。
-    let (halls, names, population, chats, profiles) = if cmd == extract::CMD_PRIVATE_DIRECT {
-        (
-            None,
-            Vec::new(),
-            None,
-            extract::extract_direct_private(payload),
-            Vec::new(),
-        )
-    } else {
-        (
-            extract::extract_hall_context(payload),
-            extract::extract_names(payload),
-            extract::extract_population_hall(payload),
-            extract::extract_chats(payload),
-            extract::extract_friend_profiles(payload),
-        )
-    };
+    // 7.2 所有聊天内容都在这一个信封里：大厅、实时私聊、好友列表、大厅成员。
+    let (halls, names, population, chats, profiles) = (
+        extract::extract_hall_context(payload),
+        extract::extract_names(payload),
+        extract::extract_population_hall(payload),
+        extract::extract_chats(payload),
+        extract::extract_friend_profiles(payload),
+    );
+    let _ = cmd;
     tracing::debug!(
         "2246 解析: hall={:?} names={} pop={:?} chats={} profiles={}",
         halls,

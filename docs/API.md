@@ -189,7 +189,7 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
     "subscribers": 1,
     "laggedTotal": 0
   },
-  "topCmds": [ { "cmd": 2246, "count": 117000 }, { "cmd": 486, "count": 1000 } ],
+  "topCmds": [ { "cmd": 24007, "count": 117000 } ],
   "service": { "port": 18889, "selfUid": 100000009, "uptimeSec": 3600, "lastMessageId": 421, "currentHall": { "id": 1000000000000000001, "type": 16 } }
 }
 ```
@@ -218,8 +218,8 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
     "packets": 1200,
     "bytes": 345600,
     "cmds": {
-      "2246": { "count": 1180, "bytes": 330400 },
-      "4410": { "count": 20, "bytes": 15200 }
+      "24007": { "count": 1180, "bytes": 330400 },
+      "29281": { "count": 20, "bytes": 15200 }
     }
   },
   "capture": {

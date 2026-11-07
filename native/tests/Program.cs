@@ -1123,8 +1123,7 @@ internal static class Program {
             Goshujin.TrackAbandonedIoTask(blocker.Task);
         }
         Check(Goshujin.AbandonedIoTaskLimitReached, "chat abandoned IO limit is reached");
-        before = HealthReporter.FramesSent;
-        Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent > before, WaitMs),
+        Check(WaitForHealthFlag(sink, HealthReporter.FlagAbandonedLimit, WaitMs),
             "heartbeat continues at the abandoned cap");
         var fCap = LatestHealthFrame(sink);
         Check((fCap.Flags & HealthReporter.FlagAbandonedLimit) != 0,
@@ -1138,6 +1137,8 @@ internal static class Program {
         Check(PacketOutbox.Disabled, "chat outbox is disabled for the independence check");
         Check(SpinWait.SpinUntil(() => HealthReporter.FramesSent > before, WaitMs),
             "heartbeat continues after PacketOutbox.Disable (independent channel)");
+        Check(WaitForHealthFlag(sink, HealthReporter.FlagChatDisabled, WaitMs),
+            "heartbeat keeps flowing after chat disable");
         var fDisabled = LatestHealthFrame(sink);
         Check((fDisabled.Flags & HealthReporter.FlagChatDisabled) != 0,
             "PacketOutbox.Disabled sets health flag bit0");
@@ -1159,6 +1160,25 @@ internal static class Program {
         BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset + 8)),
         BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset + 12)),
         BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset + 20)));
+
+    /// <summary>
+    /// 等最新心跳帧出现指定状态位。
+    /// </summary>
+    /// <remarks>
+    /// 不能用「FramesSent 比基线大」当作「新状态位已经上报」：取样基线与
+    /// PacketOutbox.Disable()/打到废弃上限之间，心跳线程完全可能恰好发出一帧
+    /// （那帧还不带新状态位）。此时 FramesSent 立刻满足条件，断言却读到旧帧，
+    /// 于是随机失败。直接等标志位本身，与时序无关。
+    /// </remarks>
+    private static bool WaitForHealthFlag(HealthSink sink, uint flag, int timeoutMs) =>
+        SpinWait.SpinUntil(() => {
+            var bytes = sink.Snapshot();
+            if (bytes.Length < HealthReporter.FrameSize) {
+                return false;
+            }
+            var offset = (bytes.Length / HealthReporter.FrameSize - 1) * HealthReporter.FrameSize;
+            return (ParseHealthFrame(bytes, offset).Flags & flag) != 0;
+        }, timeoutMs);
 
     private static HealthFrame LatestHealthFrame(HealthSink sink) {
         var bytes = sink.Snapshot();

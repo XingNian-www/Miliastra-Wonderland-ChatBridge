@@ -7,11 +7,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Copy only versioned release inputs. Runtime metadata is reused from the existing distribution.
+# Copy only release inputs. Game RVAs live in config/game-config.json now (no metadata.bin).
 $files = [ordered] @{
     'miliastra-wonderland-chatbridge.exe' = 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-chatbridge.exe'
     'MiliastraWonderlandChatBridge.Native.dll' = 'build/native/MiliastraWonderlandChatBridge.Native.dll'
-    'metadata.bin' = 'resources/metadata.bin'
     'LICENSE' = 'LICENSE'
     'THIRD_PARTY_LICENSES' = 'THIRD_PARTY_LICENSES'
     'README.md' = 'README.md'
@@ -46,4 +45,4 @@ try {
 }
 $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 "$hash  $zipName" | Set-Content -LiteralPath (Join-Path $release.FullName 'SHA256SUMS') -Encoding ascii
-Write-Host "Packaged $zipName (includes versioned metadata.bin). SHA256: $hash"
+Write-Host "Packaged $zipName (game config is fetched remotely; no metadata.bin). SHA256: $hash"

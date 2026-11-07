@@ -13,7 +13,6 @@ mod dll_health;
 mod extract;
 mod health;
 mod health_vector;
-mod metadata;
 mod model;
 mod packet_control;
 mod pipe;
@@ -588,27 +587,8 @@ fn diagnose(
         Err(error) => (false, format!("原生 DLL 缺失: {}: {error}", dll.display())),
     });
 
-    let metadata_path = exe_dir.join("metadata.bin");
-    checks.push(match std::fs::read(&metadata_path) {
-        Ok(bytes) => match crate::metadata::Metadata::parse(&bytes) {
-            Ok(parsed) => (
-                parsed.games() > 0,
-                format!(
-                    "metadata.bin: {} 字节，{} 个游戏版本",
-                    bytes.len(),
-                    parsed.games()
-                ),
-            ),
-            Err(error) => (false, format!("metadata.bin 解析失败: {error:#}")),
-        },
-        Err(error) => (
-            false,
-            format!("metadata.bin 缺失: {}: {error}", metadata_path.display()),
-        ),
-    });
-
     #[cfg(windows)]
-    checks.push(game_check(&metadata_path, game_path));
+    checks.push(game_check(game_path));
 
     let mut failures = 0usize;
     for (ok, detail) in &checks {
@@ -653,10 +633,7 @@ fn diagnose(
 
 /// 校验游戏 exe：找得到、能算出 CRC、metadata 里有完整 RVA 表。
 #[cfg(windows)]
-fn game_check(
-    metadata_path: &std::path::Path,
-    game_path: Option<&std::path::Path>,
-) -> (bool, String) {
+fn game_check(game_path: Option<&std::path::Path>) -> (bool, String) {
     use anyhow::Context as _;
     // 与注入路径共用同一套查找（--game-path → 注册表 → 默认位置），
     // 否则自检和真正启动可能指向不同的 exe。
@@ -671,15 +648,14 @@ fn game_check(
         let mut file = std::fs::File::open(game).context("打开游戏 exe 失败")?;
         let read = file.read(&mut head)?;
         head.truncate(read);
-        let crc = crate::metadata::game_crc32(&head);
-        // 与 resolve_rva 同序：配置优先，metadata.bin 兜底。
-        if let Some(rva) = crate::game_config::active().rva_for_crc(crc) {
-            return Ok((crc, rva.is_valid()));
-        }
-        let bytes = std::fs::read(metadata_path).context("读取 metadata.bin 失败")?;
-        let metadata = crate::metadata::Metadata::parse(&bytes)?;
-        let rva = metadata.for_game(crc).with_context(|| {
-            format!("既没有游戏配置也没有 metadata 里 CRC32=0x{crc:08x} 的 RVA 表")
+        // 与 resolve_rva 同源：只看游戏配置。
+        let crc = crate::game_config::game_crc32(&head);
+        let config = crate::game_config::active();
+        let rva = config.rva_for_crc(crc).with_context(|| {
+            format!(
+                "游戏配置里没有 CRC32=0x{crc:08x} 的 RVA 表（已知版本: {}）",
+                config.known_crc_summary()
+            )
         })?;
         Ok((crc, rva.is_valid()))
     })();

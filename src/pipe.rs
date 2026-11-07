@@ -72,12 +72,12 @@ pub fn parse(kind: u8, body: &[u8]) -> Result<Option<(Frame, usize)>> {
 }
 
 /// 对一帧的应答字节。
-pub fn reply(frame: &Frame, rva: &crate::metadata::MethodRva) -> Vec<u8> {
+pub fn reply(frame: &Frame, rva: &crate::game_config::RvaSpec) -> Vec<u8> {
     reply_with_cmds(frame, rva, &[])
 }
 
 /// 带订阅表覆盖的握手回执。cmds 为空时回落到编译期默认。
-pub fn reply_with_cmds(frame: &Frame, rva: &crate::metadata::MethodRva, cmds: &[u16]) -> Vec<u8> {
+pub fn reply_with_cmds(frame: &Frame, rva: &crate::game_config::RvaSpec, cmds: &[u16]) -> Vec<u8> {
     match frame {
         Frame::LoadTasks => {
             // 订阅信封 2246 与独立私聊 486，两者都可能承载聊天。
@@ -103,11 +103,10 @@ pub fn reply_with_cmds(frame: &Frame, rva: &crate::metadata::MethodRva, cmds: &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::MethodRva;
+    use crate::game_config::RvaSpec;
 
-    fn sample_rva() -> MethodRva {
-        MethodRva {
-            do_cmd: 1,
+    fn sample_rva() -> RvaSpec {
+        RvaSpec {
             update_normal_prop: 2,
             new_string: 3,
             find_game_object: 4,
@@ -216,7 +215,9 @@ mod tests {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert_eq!(values[0], 1, "do_cmd 第一个读");
+        // 下标 0 是 DoCmd：本项目不用，配置里没有这个字段，固定发 0。
+        assert_eq!(values[0], 0, "do_cmd 占位固定 0");
+        assert_eq!(values[1], 2, "update_normal_prop 第二个读");
         assert_eq!(values[6], 425_587_504, "to_int32 第七个读");
         assert_eq!(values[7], 91_775_080, "tcp_state_ptr 第八个读");
         assert_eq!(values[9], 115_234_864, "decompress 最后读");

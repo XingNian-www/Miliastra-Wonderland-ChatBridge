@@ -157,9 +157,18 @@ impl RvaSpec {
             && self.decompress != 0
     }
 
-    /// 按 DLL 期望的顺序展开（见 Goshujin.LoadMethodTable）。
+    /// 按 DLL 期望的顺序展开成 0xFD 握手帧的 10 个 u32。
+    ///
+    /// 下标 0 是 DoCmd（本项目不用，固定 0），DLL 的 ApplyMethodTable 从下标 1
+    /// 开始逐个取：1=UpdateNormalProp、2=NewString、3=FindGameObject、
+    /// 4=EventSystemUpdate、5=SimulatePointerClick、6=ToInt32、
+    /// 7=TcpStatePtr、8=SharedInfoPtr、9=Decompress。
+    ///
+    /// **顺序错了会直接拿到错误的函数指针**（等于把别的函数当地址用），
+    /// 所以这里由单测钉死，不能随手改。
     pub fn to_wire(self) -> [u32; 10] {
         [
+            0,
             self.update_normal_prop,
             self.new_string,
             self.find_game_object,
@@ -169,7 +178,6 @@ impl RvaSpec {
             self.tcp_state_ptr,
             self.shared_info_ptr,
             self.decompress,
-            0,
         ]
     }
 }
@@ -232,6 +240,18 @@ pub struct LayoutSpec {
 
 impl GameConfig {
     /// 按 exe CRC32 查 RVA 表。
+    /// 配置里已知的版本，拼成 "7.2.0=8cb60f3d" 形式，用于报错时提示。
+    pub fn known_crc_summary(&self) -> String {
+        if self.versions.is_empty() {
+            return "（配置里没有任何版本）".to_owned();
+        }
+        self.versions
+            .iter()
+            .map(|version| format!("{}={}", version.game_version, version.exe_crc32))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn rva_for_crc(&self, crc32: u32) -> Option<&RvaSpec> {
         self.versions
             .iter()
@@ -302,6 +322,25 @@ pub fn parse_crc32(text: &str) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(digits, 16).ok()
+}
+
+/// 游戏 exe 的版本指纹：前 64KiB 的标准 CRC32。
+///
+/// 配置里的 versions[].exeCrc32 就是它。用它把 exe 映射到一套 RVA，
+/// 游戏更新后 CRC 会变，配置里补一条即可。
+pub fn game_crc32(head: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in head {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 /// 把 CRC32 格式化成配置里用的 8 位小写十六进制。
@@ -671,5 +710,50 @@ mod tests {
             direct > 0,
             "直连在国内实测 19~21 秒，不能排在第一个（会拖慢启动）"
         );
+    }
+    #[test]
+    fn rva_wire_layout_matches_dll_contract() {
+        // DLL 的 ApplyMethodTable 用固定下标取函数指针（下标 0 是 DoCmd，本项目不用）。
+        // 这里把映射钉死：顺序错一个位置就会把错的函数当地址用，游戏直接崩。
+        let rva = RvaSpec {
+            update_normal_prop: 11,
+            new_string: 22,
+            find_game_object: 33,
+            event_system_update: 44,
+            simulate_pointer_click: 55,
+            to_int32: 66,
+            tcp_state_ptr: 77,
+            shared_info_ptr: 88,
+            decompress: 99,
+        };
+        let wire = rva.to_wire();
+        assert_eq!(wire[0], 0, "下标 0 必须是未使用的 DoCmd 占位");
+        assert_eq!(wire[1], 11, "1=UpdateNormalProp");
+        assert_eq!(wire[2], 22, "2=NewString");
+        assert_eq!(wire[3], 33, "3=FindGameObject");
+        assert_eq!(wire[4], 44, "4=EventSystemUpdate");
+        assert_eq!(wire[5], 55, "5=SimulatePointerClick");
+        assert_eq!(wire[6], 66, "6=ToInt32");
+        assert_eq!(wire[7], 77, "7=TcpStatePtr");
+        assert_eq!(wire[8], 88, "8=SharedInfoPtr");
+        assert_eq!(wire[9], 99, "9=Decompress");
+    }
+
+    #[test]
+    fn game_crc32_matches_standard_vector() {
+        // 标准 CRC32 测试向量，同时确认实现没有把初值/异或写反。
+        assert_eq!(game_crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(game_crc32(b""), 0);
+    }
+
+    #[test]
+    fn known_crc_summary_lists_versions() {
+        let config = default_config();
+        let summary = config.known_crc_summary();
+        assert!(summary.contains("7.2.0"), "摘要应包含版本号: {summary}");
+        assert!(summary.contains("8cb60f3d"), "摘要应包含 CRC: {summary}");
+        // 当前线上版本必须能在配置里查到 RVA，否则注入会直接失败。
+        let rva = config.rva_for_crc(0x8cb6_0f3d).expect("7.2 必须有 RVA 表");
+        assert!(rva.is_valid());
     }
 }

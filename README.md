@@ -13,7 +13,7 @@ dotnet publish native/MiliastraWonderlandChatBridge.Native.csproj -c Release
 
 ## 使用
 
-从 GitHub Releases 下载 Windows x64 压缩包并解压，使用独立端口和自定义令牌启动。包内包含宿主、原生组件和版本相关的 `metadata.bin`；游戏更新后可能需要更新该资源。游戏已在运行时默认进入 reattach 等待（见「生命周期：reattach 与退出码」），不需要先手动退出；只有用 `--reattach-seconds 0` 关闭 reattach 时才要求先退出游戏。
+从 GitHub Releases 下载 Windows x64 压缩包并解压，使用独立端口和自定义令牌启动。包内包含宿主与原生组件；游戏版本相关的 RVA 与字段号来自 `config/game-config.json`，启动时自动拉取（多源回退 + 本地缓存），游戏更新后通常**只需更新这份 JSON**，不用换包。游戏已在运行时默认进入 reattach 等待（见「生命周期：reattach 与退出码」），不需要先手动退出；只有用 `--reattach-seconds 0` 关闭 reattach 时才要求先退出游戏。
 
 ```sh
 miliastra-wonderland-chatbridge --port 18889 --token <自定义令牌> --self-uid <UID>
@@ -110,7 +110,7 @@ curl -X POST http://127.0.0.1:18889/debug/capture \
 miliastra-wonderland-chatbridge --diagnose --port 18889 --token <令牌> --self-uid <UID>
 ```
 
-它会检查端口占用、DLL、`metadata.bin`，Windows 上还会校验游戏 exe 的 CRC32 与 RVA 表完整性。
+它会检查端口占用、DLL、游戏配置来源，Windows 上还会校验游戏 exe 的 CRC32 与 RVA 表完整性。
 
 ### 排查"消息延迟"的顺序
 
@@ -282,9 +282,11 @@ https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/m
 游戏每次大版本更新会同时动三处：**exe 的 RVA 表**、**信封 cmdId**、**protobuf 字段号**。
 三者互相独立，按下面的顺序排查最快——每一层都有对应的低成本修法。
 
-### 1. RVA 表（metadata.bin）
+### 1. RVA 表（game-config.json 的 `versions[]`）
 
-游戏 exe 变了，`metadata.bin` 里的 `CRC32 -> RVA` 表就对不上，注入会在最早期失败。
+游戏 exe 变了，`game-config.json` 里 `CRC32 -> RVA` 的映射就对不上，注入会在最早期失败。
+
+**修法：在 JSON 里补一条 version 即可，不用重新编译、也不用换 DLL。**
 
 ```powershell
 .\miliastra-wonderland-chatbridge.exe --diagnose --no-log-file --port 18999 --token t --self-uid 1
@@ -296,7 +298,7 @@ https://raw.githubusercontent.com/XingNian-www/Miliastra-Wonderland-ChatBridge/m
 [OK] 游戏 exe: ...\YuanShen.exe（CRC32=0x8cb60f3d，RVA 表完整）
 ```
 
-若报 `metadata 里没有 CRC32=0x... 的 RVA 表`，说明这张表缺这个版本。
+若报 `游戏配置里没有 CRC32=0x... 的 RVA 表`，说明配置里缺这个版本：把新的 `exeCrc32` 与 RVA 补进 `versions[]`（推到 GitHub 后重启桥即可生效）。
 定位方法（已验证可用）：
 
 - 拿**上一版 exe** 与新版 exe 同目录对比；

@@ -346,7 +346,7 @@ enum SessionEnd {
 fn serve_connected(
     proc: &SuspendedProcess,
     stream: &mut std::fs::File,
-    rva: &crate::metadata::MethodRva,
+    rva: &crate::game_config::RvaSpec,
     chat: &ChatState,
     cancelled: &AtomicBool,
     wanted_cmds: &[u16],
@@ -1311,47 +1311,33 @@ fn accept_pipe(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<()> {
 }
 
 /// 解析 metadata，按游戏 exe 的 CRC32 取 RVA 表。
-fn resolve_rva(exe: &std::path::Path) -> Result<crate::metadata::MethodRva> {
+fn resolve_rva(exe: &std::path::Path) -> Result<crate::game_config::RvaSpec> {
     use std::io::Read;
-    use std::sync::OnceLock;
-
-    // metadata 是 165KB 的 protobuf，每轮重试都解析纯属浪费。
-    // 游戏更新会换 metadata 文件，但那种情况需要重启本程序，缓存是安全的。
-    static META: OnceLock<Result<crate::metadata::Metadata, String>> = OnceLock::new();
-    let meta = META.get_or_init(|| {
-        let meta_path = locate_metadata().map_err(|e| format!("{e:#}"))?;
-        let bytes = std::fs::read(&meta_path)
-            .map_err(|e| format!("读取 metadata 失败 {}: {e}", meta_path.display()))?;
-        let meta = crate::metadata::Metadata::parse(&bytes).map_err(|e| format!("{e:#}"))?;
-        tracing::info!(
-            "metadata 版本 {}，包含 {} 个游戏版本的 RVA 表",
-            meta.version,
-            meta.rva_by_game.len()
-        );
-        Ok(meta)
-    });
-    let meta = match meta {
-        Ok(meta) => meta,
-        Err(message) => anyhow::bail!("{message}"),
-    };
 
     let mut head = vec![0u8; 65536];
     let mut file = std::fs::File::open(exe)
         .with_context(|| format!("打开游戏 exe 失败: {}", exe.display()))?;
     let read = file.read(&mut head).context("读取游戏 exe 头部失败")?;
     head.truncate(read);
-    let crc = crate::metadata::game_crc32(&head);
+    let crc = crate::game_config::game_crc32(&head);
     tracing::debug!("游戏 exe CRC32 = 0x{crc:08x}");
 
-    let table = meta.for_game(crc).with_context(|| {
-        format!(
-            "metadata 里没有 CRC32=0x{crc:08x} 的 RVA 表（游戏版本可能已更新，需重新获取 metadata）"
-        )
-    })?;
-    if !table.is_valid() {
-        anyhow::bail!("RVA 表不完整（to_int32/tcp_state_ptr/decompress 不能为 0）");
-    }
-    Ok(table.clone())
+    // 只从配置取：游戏更新后在 game-config.json 的 versions[] 补一条即可，
+    // 不用等上游 CDN 的 metadata，也不用重新编译。
+    let config = crate::game_config::active();
+    let Some(rva) = config.rva_for_crc(crc) else {
+        anyhow::bail!(
+            "游戏配置里没有 CRC32=0x{crc:08x} 的 RVA 表（已知版本: {}）。\
+             游戏可能刚更新：更新 config/game-config.json（或远程配置）即可，无需重新编译",
+            config.known_crc_summary()
+        );
+    };
+    anyhow::ensure!(
+        rva.is_valid(),
+        "RVA 表不完整（to_int32/tcp_state_ptr/shared_info_ptr/decompress 不能为 0）"
+    );
+    tracing::info!("使用游戏配置的 RVA 表（CRC32=0x{crc:08x}）");
+    Ok(*rva)
 }
 
 /// 从启动器注册表读安装目录。
@@ -1439,17 +1425,6 @@ fn registry_install_dirs() -> Vec<std::path::PathBuf> {
 /// 之前这里是三处硬编码路径，换个盘或非默认安装就找不到游戏。
 pub(crate) fn locate_game(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
     crate::game_path::resolve(explicit, registry_install_dirs())
-}
-
-/// metadata.bin 的位置（与程序同目录）。
-fn locate_metadata() -> Result<std::path::PathBuf> {
-    let exe_dir = std::env::current_exe()?;
-    let dir = exe_dir.parent().unwrap_or(std::path::Path::new("."));
-    let path = dir.join("metadata.bin");
-    if path.is_file() {
-        return Ok(path);
-    }
-    anyhow::bail!("未找到 metadata.bin（应与本程序同目录，来自 YaeAchievement 的 CDN）")
 }
 
 /// 注入用的 DLL。
@@ -2119,9 +2094,8 @@ mod tests {
         assert!(check_session(&proc, &AtomicBool::new(false), std::time::Instant::now()).is_err());
     }
 
-    fn sample_rva() -> crate::metadata::MethodRva {
-        crate::metadata::MethodRva {
-            do_cmd: 1,
+    fn sample_rva() -> crate::game_config::RvaSpec {
+        crate::game_config::RvaSpec {
             update_normal_prop: 2,
             new_string: 3,
             find_game_object: 4,

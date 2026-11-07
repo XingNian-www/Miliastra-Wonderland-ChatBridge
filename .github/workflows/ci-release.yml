@@ -98,4 +98,4 @@ jobs:
         run: >-
           gh release create "$RELEASE_TAG" release/*.zip release/SHA256SUMS
           --verify-tag --generate-notes --title "$RELEASE_TAG"
-          --notes "Windows x64 package includes the Rust host, NativeAOT DLL, versioned metadata.bin, licenses, README and API documentation. Runtime metadata may need updating after a game update. No game is started during CI."
+          --notes "Windows x64 package includes the Rust host, NativeAOT DLL, licenses, README and API documentation. Game RVAs and chat field numbers come from config/game-config.json, fetched at startup (multi-source, cached locally) - no metadata.bin needed. No game is started during CI."

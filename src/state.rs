@@ -5,7 +5,7 @@
 //! 自己的发言只更新大厅状态，不作为命令推送。
 //! 7154 人数包提供补充大厅信号，不用于过滤实时大厅消息。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::{RwLock, broadcast};
@@ -23,6 +23,15 @@ pub const BROADCAST_CAPACITY: usize = 256;
 /// 实测：跨厅公共频道固定为 23，私人大厅为 16。用它可以在还不知道
 /// "我在哪个大厅"时就先排掉公共频道，减少噪音与误判。
 pub const PUBLIC_CHANNEL_HALL_TYPE: u32 = 23;
+
+/// 判定全量快照所需的最少记录数。
+///
+/// 低于这个数量时无法区分「全量」与「懒加载增量」，一律按增量合并，
+/// 避免小好友表里错把增量当快照而误删备注。
+const FULL_SNAPSHOT_MIN_RECORDS: usize = 4;
+
+/// 全量快照允许缺席的好友数（好友被删时会出现）。
+const FULL_SNAPSHOT_MAX_MISSING: usize = 2;
 
 /// 历史消息的容忍窗口（秒）。
 ///
@@ -160,6 +169,9 @@ struct Inner {
     /// 好友备注（4410 的 #17）。与昵称分开存：备注是玩家自己起的名字，
     /// 可随时清空或改写，绝不能拿来当身份判断。
     remarks: BTreeMap<u32, String>,
+    /// 已知好友的 UID 集合。用来判断一次好友列表是全量快照还是懒加载增量，
+    /// 并支撑「全量里没带备注 = 已被删除」的覆盖语义。
+    friend_uids: BTreeSet<u32>,
     /// 已推送的最大 id。
     last_id: u64,
     /// 是否已收到过 4410 好友列表。
@@ -174,6 +186,29 @@ struct Inner {
     recent_set: std::collections::HashSet<u64>,
 }
 
+/// 判定一次好友列表是不是「全量快照」。
+///
+/// 真机上每 60 秒的全量包包含所有好友；懒加载增量只带一两条。
+/// 判错的代价不对称：把增量当全量会**误删**备注，把全量当增量只是少清一次，
+/// 所以这里一律从严：
+///
+/// - 记录数少于 FULL_SNAPSHOT_MIN_RECORDS：当增量（极小好友表无法区分）；
+/// - 覆盖不到已知好友的 3/4：当增量；
+/// - 缺失好友数超过容忍值：当增量（避免一次残缺包清掉一堆备注）。
+fn is_full_snapshot(incoming: &BTreeSet<u32>, known: &BTreeSet<u32>) -> bool {
+    if known.is_empty() {
+        return true;
+    }
+    if incoming.len() < FULL_SNAPSHOT_MIN_RECORDS {
+        return false;
+    }
+    if incoming.len() * 4 < known.len() * 3 {
+        return false;
+    }
+    let tolerance = FULL_SNAPSHOT_MAX_MISSING + known.len() / 10;
+    known.difference(incoming).count() <= tolerance
+}
+
 impl ChatState {
     pub fn new(self_uid: u32) -> Arc<Self> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -184,6 +219,7 @@ impl ChatState {
                 messages: VecDeque::new(),
                 names: BTreeMap::new(),
                 remarks: BTreeMap::new(),
+                friend_uids: BTreeSet::new(),
                 last_id: 0,
                 friend_list_seen: false,
                 accepted_after: unix_now() - STALE_GRACE_SECS,
@@ -228,12 +264,20 @@ impl ChatState {
         }
     }
 
-    /// 合并好友档案（4410）：昵称与备注各写各的。
+    /// 合并好友档案（29281）：昵称与备注各写各的。
     ///
-    /// 这张表只在进游戏时全量来一次，之后都是懒加载的增量；所以合并必须
-    /// 只增不删——某次增量里没提到的 UID，不能把它已有的备注抹掉。
-    /// 备注为空、或本条记录根本没带 #17 时，保留原值。
-    /// 返回本次是否建立了全量基线（用于日志区分“首次全量”与“懒加载增量”）。
+    /// 现实约束（真机实测）：好友列表进游戏时全量下发一次，之后**每 60 秒
+    /// 全量重发一次**；此外还有只带一两条的懒加载增量。两类包没有显式标记，
+    /// 只能按内容区分，见 is_full_snapshot。
+    ///
+    /// 语义分两种：
+    /// - **全量快照**：记录里没带 #17 就是「该好友没有备注」→ 清除旧值；
+    ///   快照里消失的好友，备注也一并清掉（昵称保留，历史消息还要用）。
+    ///   这是实时同步的关键：玩家在游戏里删掉备注，最多 60 秒后这里就清掉。
+    /// - **懒加载增量**：只增不删。增量没提到某人时保留原值，
+    ///   否则一次只带一条的增量会把其他人的备注全抹掉。
+    ///
+    /// 返回本次是否建立了全量基线（首次全量）。
     pub async fn record_friend_profiles(&self, profiles: Vec<FriendProfile>) -> bool {
         if profiles.is_empty() {
             return false;
@@ -241,13 +285,47 @@ impl ChatState {
         let mut inner = self.inner.write().await;
         let baseline = !inner.friend_list_seen;
         inner.friend_list_seen = true;
-        for profile in profiles {
-            if let Some(name) = profile.name {
-                inner.names.insert(profile.uid, name);
+
+        let incoming: BTreeSet<u32> = profiles.iter().map(|profile| profile.uid).collect();
+        let full = is_full_snapshot(&incoming, &inner.friend_uids);
+
+        let mut updated = 0usize;
+        let mut cleared = 0usize;
+        for profile in &profiles {
+            if let Some(name) = profile.name.as_deref() {
+                inner.names.insert(profile.uid, name.to_owned());
             }
-            if let Some(remark) = profile.remark {
-                inner.remarks.insert(profile.uid, remark);
+            match profile.remark.as_deref() {
+                Some(remark) if !remark.is_empty() => {
+                    let previous = inner.remarks.insert(profile.uid, remark.to_owned());
+                    if previous.as_deref() != Some(remark) {
+                        updated += 1;
+                    }
+                }
+                _ => {
+                    // 全量快照里没带备注 = 玩家删掉了；增量包保留原值。
+                    if full && inner.remarks.remove(&profile.uid).is_some() {
+                        cleared += 1;
+                    }
+                }
             }
+        }
+
+        if full {
+            // 先算出差异再改：同时借用 friend_uids 与 remarks 会被借用检查拒绝。
+            let gone: Vec<u32> = inner.friend_uids.difference(&incoming).copied().collect();
+            for uid in gone {
+                if inner.remarks.remove(&uid).is_some() {
+                    cleared += 1;
+                }
+            }
+            inner.friend_uids = incoming;
+        } else {
+            inner.friend_uids.extend(incoming);
+        }
+
+        if updated > 0 || cleared > 0 {
+            tracing::info!("好友备注同步：更新 {updated} 条、清除 {cleared} 条（全量快照={full}）");
         }
         baseline
     }
@@ -956,5 +1034,133 @@ mod tests {
                 .any(|m| m.contains("7154 人数包给出当前大厅: 300")),
             "{messages:?}"
         );
+    }
+    /// 6 个好友的完整快照：模拟真机每 60 秒一次的全量包。
+    fn full_snapshot(remarks: &[(u32, Option<&str>)]) -> Vec<FriendProfile> {
+        remarks
+            .iter()
+            .map(|(uid, remark)| profile(*uid, Some("昵称"), *remark))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_snapshot_clears_remark_when_field_is_gone() {
+        let state = ChatState::new(999);
+        let uids = [1, 2, 3, 4, 5, 6];
+        state
+            .record_friend_profiles(
+                uids.iter()
+                    .map(|uid| profile(*uid, Some("昵称"), Some("旧备注")))
+                    .collect(),
+            )
+            .await;
+        assert_eq!(state.remark_count().await, 6);
+
+        // 下一次全量快照里 #1 不再带 #17 —— 玩家把备注删了。
+        state
+            .record_friend_profiles(full_snapshot(&[
+                (1, None),
+                (2, Some("旧备注")),
+                (3, Some("旧备注")),
+                (4, Some("旧备注")),
+                (5, Some("旧备注")),
+                (6, Some("旧备注")),
+            ]))
+            .await;
+        assert_eq!(state.remark_count().await, 5, "全量快照缺 #17 应清除备注");
+        assert!(!state.remarks(&[1, 2]).await.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn full_snapshot_updates_changed_remark() {
+        let state = ChatState::new(999);
+        let uids = [1, 2, 3, 4, 5, 6];
+        state
+            .record_friend_profiles(
+                uids.iter()
+                    .map(|uid| profile(*uid, Some("昵称"), Some("旧备注")))
+                    .collect(),
+            )
+            .await;
+        let mut next = full_snapshot(&[
+            (1, Some("新备注")),
+            (2, Some("旧备注")),
+            (3, Some("旧备注")),
+            (4, Some("旧备注")),
+            (5, Some("旧备注")),
+            (6, Some("旧备注")),
+        ]);
+        next[0].remark = Some("新备注".to_owned());
+        state.record_friend_profiles(next).await;
+        let remarks = state.remarks(&[1]).await;
+        assert_eq!(remarks.get(&1).map(String::as_str), Some("新备注"));
+    }
+
+    #[tokio::test]
+    async fn incremental_packet_still_keeps_other_remarks() {
+        // 与 lazy_refresh_keeps_previous_remarks 互补：好友数较多时，
+        // 只带 2 条的增量也必须按合并处理，不能清掉其他人的备注。
+        let state = ChatState::new(999);
+        let uids = [1, 2, 3, 4, 5, 6];
+        state
+            .record_friend_profiles(
+                uids.iter()
+                    .map(|uid| profile(*uid, Some("昵称"), Some("备注")))
+                    .collect(),
+            )
+            .await;
+        state
+            .record_friend_profiles(vec![
+                profile(2, Some("乙改名"), None),
+                profile(3, None, None),
+            ])
+            .await;
+        assert_eq!(state.remark_count().await, 6, "增量包不能清除备注");
+    }
+
+    #[tokio::test]
+    async fn full_snapshot_drops_remark_of_removed_friend() {
+        let state = ChatState::new(999);
+        let uids = [1, 2, 3, 4, 5, 6];
+        state
+            .record_friend_profiles(
+                uids.iter()
+                    .map(|uid| profile(*uid, Some("昵称"), Some("备注")))
+                    .collect(),
+            )
+            .await;
+        // 6 号好友被删：快照里只剩 5 个。
+        state
+            .record_friend_profiles(full_snapshot(&[
+                (1, Some("备注")),
+                (2, Some("备注")),
+                (3, Some("备注")),
+                (4, Some("备注")),
+                (5, Some("备注")),
+            ]))
+            .await;
+        assert!(
+            !state.remarks(&[6]).await.contains_key(&6),
+            "好友被删应清掉备注"
+        );
+        assert_eq!(state.remark_count().await, 5);
+    }
+
+    #[test]
+    fn snapshot_detection_is_conservative() {
+        let known: BTreeSet<u32> = (1..=10).collect();
+        // 全量：10/10。
+        assert!(is_full_snapshot(&(1..=10).collect(), &known));
+        // 少 1~2 个（好友被删）仍算全量。
+        assert!(is_full_snapshot(&(1..=9).collect(), &known));
+        assert!(is_full_snapshot(&(1..=8).collect(), &known));
+        // 只带几条：增量。
+        assert!(!is_full_snapshot(&(1..=3).collect(), &known));
+        assert!(!is_full_snapshot(&(1..=6).collect(), &known));
+        // 首包无基线：当全量建立基线。
+        assert!(is_full_snapshot(&(1..=6).collect(), &BTreeSet::new()));
+        // 极小好友表：记录不足下限，绝不按全量处理。
+        let tiny: BTreeSet<u32> = (1..=3).collect();
+        assert!(!is_full_snapshot(&(1..=2).collect(), &tiny));
     }
 }

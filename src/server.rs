@@ -71,6 +71,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/messages", get(messages))
         .route("/names", get(names))
+        // 全量好友快照：/names 必须带 UID 才能查，应用侧拿不到「当前有哪些好友」。
+        .route("/friends", get(friends))
         .route("/stream", get(stream))
         .route("/debug/metrics", get(debug_metrics))
         .route("/debug/events", get(debug_events))
@@ -253,6 +255,47 @@ async fn messages(
 #[derive(Deserialize)]
 struct NamesQuery {
     uids: String,
+}
+
+/// GET /friends：返回全量好友快照。
+///
+/// 为什么需要它：/names 必须显式传 UID 才能查，应用侧无法知道「当前有哪些好友」，
+/// 也就没法做强制覆盖（拿着旧名单去比对）。好友列表本来每 60 秒全量重发一次，
+/// 这里直接把它暴露出来，附 complete 标志说明缺席者是否可信。
+async fn friends(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(err) = check_token(&state, &headers) {
+        return err.into_response();
+    }
+    if !state.connected.load(std::sync::atomic::Ordering::Relaxed) {
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "game_not_connected",
+            "game is not running or injection failed".into(),
+        )
+        .into_response();
+    }
+    let snapshot = state.chat.friends_snapshot().await;
+    let friends: Vec<serde_json::Value> = snapshot
+        .entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "uid": entry.uid,
+                "name": entry.name,
+                "remark": entry.remark,
+            })
+        })
+        .collect();
+    Json(json!({
+        "ok": true,
+        // 只有 true 才能据此删除本地数据：缺席者与 remark=null 都是权威结论。
+        // false 表示中间混入过懒加载增量，只可增补，等下一次全量（≤60 秒）。
+        "complete": snapshot.complete,
+        "updatedAt": snapshot.updated_at,
+        "count": friends.len(),
+        "friends": friends,
+    }))
+    .into_response()
 }
 
 async fn names(
@@ -1453,5 +1496,60 @@ mod tests {
         assert!(!token_matches("abc", "ab"));
         assert!(!token_matches("abc", "abcd"));
         assert!(!token_matches("abc", ""));
+    }
+    #[tokio::test]
+    async fn friends_endpoint_returns_full_snapshot() {
+        use crate::extract::FriendProfile;
+        let state = app_state(true);
+        state
+            .chat
+            .record_friend_profiles(vec![
+                FriendProfile {
+                    uid: 100000001,
+                    name: Some("甲".into()),
+                    remark: Some("备注甲".into()),
+                },
+                FriendProfile {
+                    uid: 100000002,
+                    name: Some("乙".into()),
+                    remark: None,
+                },
+                FriendProfile {
+                    uid: 100000003,
+                    name: Some("丙".into()),
+                    remark: None,
+                },
+                FriendProfile {
+                    uid: 100000004,
+                    name: Some("丁".into()),
+                    remark: None,
+                },
+            ])
+            .await;
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(json_request("GET", "/friends", None, Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["complete"], true);
+        assert_eq!(value["count"], 4);
+        let friends = value["friends"].as_array().unwrap();
+        assert_eq!(friends.len(), 4);
+        let first = friends.iter().find(|f| f["uid"] == 100000001).unwrap();
+        assert_eq!(first["name"], "甲");
+        assert_eq!(first["remark"], "备注甲");
+        let second = friends.iter().find(|f| f["uid"] == 100000002).unwrap();
+        assert!(second["remark"].is_null());
+
+        // 令牌是硬要求：缺失即 401。
+        let response = app
+            .oneshot(json_request("GET", "/friends", None, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

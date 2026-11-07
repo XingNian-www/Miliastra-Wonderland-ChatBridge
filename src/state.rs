@@ -172,6 +172,13 @@ struct Inner {
     /// 已知好友的 UID 集合。用来判断一次好友列表是全量快照还是懒加载增量，
     /// 并支撑「全量里没带备注 = 已被删除」的覆盖语义。
     friend_uids: BTreeSet<u32>,
+    /// 当前好友表是否来自「全量快照」。
+    ///
+    /// 只有 true 时「列表里没有某个好友 / 某个好友没有备注」才是权威结论；
+    /// 一旦混入懒加载增量就置 false，下游应只做增补，等下一次全量（≤60 秒）再清理。
+    friends_complete: bool,
+    /// 最近一次全量快照的 Unix 秒时间戳；从没收到过为 None。
+    friends_updated_at: Option<i64>,
     /// 已推送的最大 id。
     last_id: u64,
     /// 是否已收到过 4410 好友列表。
@@ -184,6 +191,26 @@ struct Inner {
     /// 最近发过的消息指纹，用于压掉周期性重放。
     recent: VecDeque<u64>,
     recent_set: std::collections::HashSet<u64>,
+}
+
+/// 单个好友的公开视图。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FriendEntry {
+    pub uid: u32,
+    /// 游戏内昵称；未知时为 None。
+    pub name: Option<String>,
+    /// 玩家设置的备注；None = 当前没有备注。
+    pub remark: Option<String>,
+}
+
+/// 一份好友快照 + 它的完整性。
+#[derive(Clone, Debug)]
+pub struct FriendsSnapshot {
+    /// 列表是否来自全量快照（决定调用方能否据此删除）。
+    pub complete: bool,
+    /// 最近一次全量快照的时间（Unix 秒）。
+    pub updated_at: Option<i64>,
+    pub entries: Vec<FriendEntry>,
 }
 
 /// 判定一次好友列表是不是「全量快照」。
@@ -220,6 +247,8 @@ impl ChatState {
                 names: BTreeMap::new(),
                 remarks: BTreeMap::new(),
                 friend_uids: BTreeSet::new(),
+                friends_complete: false,
+                friends_updated_at: None,
                 last_id: 0,
                 friend_list_seen: false,
                 accepted_after: unix_now() - STALE_GRACE_SECS,
@@ -312,6 +341,8 @@ impl ChatState {
         }
 
         if full {
+            inner.friends_complete = true;
+            inner.friends_updated_at = Some(unix_now());
             // 先算出差异再改：同时借用 friend_uids 与 remarks 会被借用检查拒绝。
             let gone: Vec<u32> = inner.friend_uids.difference(&incoming).copied().collect();
             for uid in gone {
@@ -321,6 +352,8 @@ impl ChatState {
             }
             inner.friend_uids = incoming;
         } else {
+            // 增量进了表：「缺谁」不再权威，等下一次全量快照再恢复。
+            inner.friends_complete = false;
             inner.friend_uids.extend(incoming);
         }
 
@@ -328,6 +361,29 @@ impl ChatState {
             tracing::info!("好友备注同步：更新 {updated} 条、清除 {cleared} 条（全量快照={full}）");
         }
         baseline
+    }
+
+    /// 全量好友快照，供 GET /friends 使用。
+    ///
+    /// complete=true 表示这份列表来自全量快照：不在列表里的好友、以及 remark
+    /// 为 None 的条目都是权威结论，调用方可以据此**删除**本地数据。
+    /// complete=false 时只能增补，不能删（增量包没提到的人不代表不存在）。
+    pub async fn friends_snapshot(&self) -> FriendsSnapshot {
+        let inner = self.inner.read().await;
+        let entries: Vec<FriendEntry> = inner
+            .friend_uids
+            .iter()
+            .map(|uid| FriendEntry {
+                uid: *uid,
+                name: inner.names.get(uid).cloned(),
+                remark: inner.remarks.get(uid).cloned(),
+            })
+            .collect();
+        FriendsSnapshot {
+            complete: inner.friends_complete,
+            updated_at: inner.friends_updated_at,
+            entries,
+        }
     }
 
     /// 备注表规模，供诊断接口观察是否已经收到过全量基线。
@@ -1162,5 +1218,42 @@ mod tests {
         // 极小好友表：记录不足下限，绝不按全量处理。
         let tiny: BTreeSet<u32> = (1..=3).collect();
         assert!(!is_full_snapshot(&(1..=2).collect(), &tiny));
+    }
+    #[tokio::test]
+    async fn friends_snapshot_reports_completeness() {
+        let state = ChatState::new(999);
+        let empty = state.friends_snapshot().await;
+        assert!(!empty.complete, "没收到过快照时不能声称完整");
+        assert!(empty.entries.is_empty());
+        assert!(empty.updated_at.is_none());
+
+        let uids = [1, 2, 3, 4, 5, 6];
+        state
+            .record_friend_profiles(
+                uids.iter()
+                    .map(|uid| {
+                        let remark = if *uid == 1 { Some("备注甲") } else { None };
+                        profile(*uid, Some("昵称"), remark)
+                    })
+                    .collect(),
+            )
+            .await;
+        let snap = state.friends_snapshot().await;
+        assert!(snap.complete, "全量快照应标记完整");
+        assert!(snap.updated_at.is_some());
+        assert_eq!(snap.entries.len(), 6);
+        let first = snap.entries.iter().find(|entry| entry.uid == 1).unwrap();
+        assert_eq!(first.name.as_deref(), Some("昵称"));
+        assert_eq!(first.remark.as_deref(), Some("备注甲"));
+        let second = snap.entries.iter().find(|entry| entry.uid == 2).unwrap();
+        assert!(second.remark.is_none(), "没备注的好友 remark 应为 None");
+
+        // 混入增量包后，「缺席者」不再权威。
+        state
+            .record_friend_profiles(vec![profile(2, Some("乙"), None)])
+            .await;
+        let snap = state.friends_snapshot().await;
+        assert!(!snap.complete, "增量之后必须降级为不完整");
+        assert_eq!(snap.entries.len(), 6, "增量不能删除已有好友");
     }
 }

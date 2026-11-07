@@ -26,7 +26,8 @@ curl -H "x-miliastra-token: <token>" http://127.0.0.1:18889/health
 | GET | `/favicon.ico` | 空响应（`204`） |
 | GET | `/health` | 服务与数据源状态 |
 | GET | `/messages` | 查询缓冲消息 |
-| GET | `/names` | 批量查询昵称 |
+| GET | `/names` | 批量查询昵称与备注 |
+| GET | `/friends` | 全量好友快照（含 complete 标志） |
 | WebSocket | `/stream` | 实时事件订阅 |
 | GET | `/debug/metrics` | 完整运行指标（诊断） |
 | GET | `/debug/events` | 最近关键事件（诊断） |
@@ -384,6 +385,45 @@ GET /names?uids=100000001,100000002
 好友被删除时其备注也会清掉（昵称保留，历史消息仍可显示）。
 因此在上游做「强制覆盖」是安全的：`remarks` 里没有的 UID 就是当前确实没有备注。
 只带一两条的懒加载增量不会触发清除，避免误删。
+
+### GET /friends
+
+返回**全量好友快照**。`/names` 必须显式传 UID，应用侧无从知道
+「当前有哪些好友」，也就没法做强制覆盖；这个端点把每 60 秒全量重发的好友列表直接暴露出来。
+
+```json
+{
+  "ok": true,
+  "complete": true,
+  "updatedAt": 1794070520,
+  "count": 2,
+  "friends": [
+    { "uid": 100000001, "name": "Alice", "remark": "老板" },
+    { "uid": 100000002, "name": "Bob", "remark": null }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `complete` | bool | 这份列表是否来自**全量快照** |
+| `updatedAt` | uint64 或 null | 最近一次全量快照的 Unix 秒；没收到过为 null |
+| `count` | uint64 | 好友条数 |
+| `friends[].uid` | uint32 | 好友 UID |
+| `friends[].name` | string 或 null | 游戏内昵称 |
+| `friends[].remark` | string 或 null | 玩家设置的备注；null = 当前没有备注 |
+
+**complete 的语义决定了能不能删数据：**
+
+- `complete: true` —— 列表来自全量快照。**不在列表里的好友、以及 `remark: null` 的条目
+  都是权威结论**，调用方可以据此删除本地缓存（玩家确实删了好友或备注）。
+- `complete: false` —— 中间混入过只带一两条的懒加载增量，
+  缺席者不代表不存在，此时**只能增补、不能删除**，等下一次全量（≤60 秒）再清理。
+
+好友列表在游戏里**每 60 秒全量重发一次**，所以正常情况下 `complete` 一直是 true，
+改备注/删备注最多 60 秒后反映到这里。刚启动、还没收到第一份快照时是 `false` 且 `count: 0`。
+
+未连接游戏时返回 `503 game_not_connected`（与 `/names` 一致）。
 
 ### WebSocket /stream
 
